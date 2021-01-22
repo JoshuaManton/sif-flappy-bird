@@ -1,0 +1,974 @@
+const MAX_BOUND_TEXTURES       := 12; // todo(josh): figure out the right number for this
+const MAX_BOUND_RENDER_TARGETS := 8;  // D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT
+
+const SWAP_CHAIN_BUFFER_COUNT := 2;
+const SWAP_CHAIN_FORMAT     := Texture_Format.R8G8B8A8_UINT;
+const SWAP_CHAIN_RTV_FORMAT := Texture_Format.R8G8B8A8_UINT;
+
+enum Primitive_Topology {
+    INVALID;
+
+    TRIANGLE_LIST;
+    TRIANGLE_STRIP;
+    LINE_LIST;
+    LINE_STRIP;
+
+    COUNT;
+}
+
+enum Rasterizer_Mode {
+    INVALID;
+    NO_CULL;
+    BACKFACE_CULL;
+    FRONTFACE_CULL;
+
+    NO_CULL_WIREFRAME;
+    BACKFACE_CULL_WIREFRAME;
+    FRONTFACE_CULL_WIREFRAME;
+
+    COUNT;
+}
+
+enum Blend_Mode {
+    INVALID;
+    DEFAULT;
+    NO_BLEND;
+    TEXT;
+
+    COUNT;
+}
+
+struct Texture_Description {
+    width:           int;
+    height:          int;
+    depth:           int;
+    render_target:   bool;
+    cpu_read_target: bool;
+    uav:             bool;
+    mipmap_count:    int;
+    format:          Texture_Format;
+    type:            Texture_Type;
+    wrap_mode:       Texture_Wrap_Mode;
+    color_data:      ^u8;
+}
+
+struct Texture {
+    valid:       bool; // note(josh): just for checking against zero-value
+    description: Texture_Description;
+    backend:     Texture_Backend_Data;
+}
+
+enum Texture_Format {
+    INVALID;
+
+    R8_UINT;
+    R16_FLOAT;
+    R32_INT;
+    R32_FLOAT;
+    R16G16_FLOAT;
+    R16G16B16A16_FLOAT;
+    R32G32B32A32_FLOAT;
+    R8G8B8A8_UINT;
+    R8G8B8A8_UINT_SRGB;
+    DEPTH_STENCIL;
+
+    COUNT;
+}
+
+enum Texture_Type {
+    INVALID;
+
+    TEXTURE2D;
+    TEXTURE3D;
+    CUBEMAP;
+
+    COUNT;
+}
+
+enum Texture_Wrap_Mode {
+    INVALID;
+
+    LINEAR_WRAP;
+    LINEAR_CLAMP;
+    POINT_WRAP;
+    POINT_CLAMP;
+
+    COUNT;
+}
+
+struct Texture_Format_Info {
+    pixel_size_in_bytes: int;
+    num_channels: int;
+    is_depth_format: bool;
+}
+
+struct Color_Buffer_Binding {
+    texture: Texture;
+    clear: bool;
+    clear_color: Vector4;
+}
+
+struct Depth_Buffer_Binding {
+    texture: Texture;
+    clear: bool;
+    clear_depth: float;
+    // todo(josh): clear_stencil
+}
+
+struct Render_Target_Bindings {
+    color_bindings: [MAX_BOUND_RENDER_TARGETS]Color_Buffer_Binding;
+    depth_binding:  Depth_Buffer_Binding;
+}
+
+texture_format_infos: [cast(int, Texture_Format.COUNT)]Texture_Format_Info; // @EnumArrays
+
+proc init_render_backend(window: ^Window) {
+    texture_format_infos[cast(int, Texture_Format.R8_UINT)]            = .{1,  1, false};
+    texture_format_infos[cast(int, Texture_Format.R16_FLOAT)]          = .{2,  1, false};
+    texture_format_infos[cast(int, Texture_Format.R32_INT)]            = .{4,  1, false};
+    texture_format_infos[cast(int, Texture_Format.R32_FLOAT)]          = .{4,  1, false};
+    texture_format_infos[cast(int, Texture_Format.R16G16_FLOAT)]       = .{4,  2, false};
+    texture_format_infos[cast(int, Texture_Format.R16G16B16A16_FLOAT)] = .{8,  4, false};
+    texture_format_infos[cast(int, Texture_Format.R32G32B32A32_FLOAT)] = .{16, 4, false};
+    texture_format_infos[cast(int, Texture_Format.R8G8B8A8_UINT)]      = .{4,  4, false};
+    texture_format_infos[cast(int, Texture_Format.R8G8B8A8_UINT_SRGB)] = .{4,  4, false};
+    texture_format_infos[cast(int, Texture_Format.DEPTH_STENCIL)]      = .{4,  2, true};
+
+    // make sure all texture format infos are supplied
+    for (i := 0; i < texture_format_infos.count; i += 1) {
+        if (texture_format_infos[i].pixel_size_in_bytes == 0) {
+            if (cast(Texture_Format, i) != .INVALID && cast(Texture_Format, i) != .COUNT) {
+                print("Missing texture_format_info for %\n", cast(Texture_Format, i));
+                assert(false);
+            }
+        }
+    }
+
+    init_directx(window);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+struct Texture_Backend_Data {
+    handle_2d:            ^ID3D11Texture2D;
+    handle_3d:            ^ID3D11Texture3D;
+
+    shader_resource_view: ^ID3D11ShaderResourceView;
+    uav:                  ^ID3D11UnorderedAccessView;
+}
+
+struct Constant_Buffer { buf: ^ID3D11Buffer; }
+struct Vertex_Buffer   { buf: ^ID3D11Buffer; }
+struct Index_Buffer    { buf: ^ID3D11Buffer; }
+
+directx_device: ^ID3D11Device;
+directx_device_context: ^ID3D11DeviceContext;
+swap_chain_handle: ^IDXGISwapChain;
+swap_chain_dsv_texture: Texture;
+swap_chain_width: int;
+swap_chain_height: int;
+directx_backface_cull_rasterizer: ^ID3D11RasterizerState;
+directx_no_cull_rasterizer: ^ID3D11RasterizerState;
+directx_depth_test_state: ^ID3D11DepthStencilState;
+directx_no_depth_test_state: ^ID3D11DepthStencilState;
+linear_wrap_sampler: ^ID3D11SamplerState;
+directx_alpha_blend_state: ^ID3D11BlendState;
+directx_cur_srvs: [MAX_BOUND_TEXTURES]^ID3D11ShaderResourceView;
+directx_linear_wrap_sampler:  ^ID3D11SamplerState;
+directx_linear_clamp_sampler: ^ID3D11SamplerState;
+directx_point_wrap_sampler:   ^ID3D11SamplerState;
+directx_point_clamp_sampler:  ^ID3D11SamplerState;
+directx_current_render_targets: [MAX_BOUND_RENDER_TARGETS]Texture;
+directx_cur_rtvs: [MAX_BOUND_RENDER_TARGETS]^ID3D11RenderTargetView;
+directx_cur_dsv:  ^ID3D11DepthStencilView;
+
+dx_texture_format_mapping: [cast(int, Texture_Format.COUNT)]DXGI_FORMAT;// @EnumArrays
+
+proc init_directx(window: ^Window) {
+    dx_texture_format_mapping[cast(int, Texture_Format.R8_UINT)]            = DXGI_FORMAT_R8_UNORM;
+    dx_texture_format_mapping[cast(int, Texture_Format.R16_FLOAT)]          = DXGI_FORMAT_R16_FLOAT;
+    dx_texture_format_mapping[cast(int, Texture_Format.R32_INT)]            = DXGI_FORMAT_R32_SINT;
+    dx_texture_format_mapping[cast(int, Texture_Format.R32_FLOAT)]          = DXGI_FORMAT_R32_FLOAT;
+    dx_texture_format_mapping[cast(int, Texture_Format.R16G16_FLOAT)]       = DXGI_FORMAT_R16G16_FLOAT;
+    dx_texture_format_mapping[cast(int, Texture_Format.R16G16B16A16_FLOAT)] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    dx_texture_format_mapping[cast(int, Texture_Format.R32G32B32A32_FLOAT)] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    dx_texture_format_mapping[cast(int, Texture_Format.R8G8B8A8_UINT)]      = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dx_texture_format_mapping[cast(int, Texture_Format.R8G8B8A8_UINT_SRGB)] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    dx_texture_format_mapping[cast(int, Texture_Format.DEPTH_STENCIL)]      = DXGI_FORMAT_D24_UNORM_S8_UINT;
+
+    // make sure all texture formats have a mapping
+    for (i := 0; i < dx_texture_format_mapping.count; i += 1) {
+        if (dx_texture_format_mapping[i] == 0) {
+            if (cast(Texture_Format, i) != .INVALID && cast(Texture_Format, i) != .COUNT) {
+                print("Missing dx texture format mapping for %\n", cast(Texture_Format, i));
+                assert(false);
+            }
+        }
+    }
+
+    // Create swap chain
+    swap_chain_desc: DXGI_SWAP_CHAIN_DESC;
+    swap_chain_desc.BufferCount                        = SWAP_CHAIN_BUFFER_COUNT;
+    swap_chain_desc.SwapEffect                         = DXGI_SWAP_EFFECT_FLIP_DISCARD; // todo(josh): use DXGI_SWAP_EFFECT_DISCARD (or something else) on non-Windows 10
+    swap_chain_desc.BufferDesc.Width                   = cast(u32, window.width);
+    swap_chain_desc.BufferDesc.Height                  = cast(u32, window.height);
+    swap_chain_desc.BufferDesc.Format                  = dx_texture_format_mapping[cast(int, SWAP_CHAIN_FORMAT)];
+    swap_chain_desc.BufferDesc.RefreshRate.Numerator   = 60; // todo(josh): query monitor refresh rate.
+    swap_chain_desc.BufferDesc.RefreshRate.Denominator = 1;
+    swap_chain_desc.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swap_chain_desc.OutputWindow                       = window.handle;
+    swap_chain_desc.SampleDesc.Count                   = 1;
+    swap_chain_desc.SampleDesc.Quality                 = 0;
+    swap_chain_desc.Windowed                           = .TRUE;
+
+    requested_feature_level: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL_11_0;
+    actual_feature_level: D3D_FEATURE_LEVEL;
+    result := D3D11CreateDeviceAndSwapChain(
+        null,
+        D3D_DRIVER_TYPE_HARDWARE,
+        null,
+        D3D11_CREATE_DEVICE_DEBUG,
+        &requested_feature_level,
+        1,
+        D3D11_SDK_VERSION,
+        &swap_chain_desc,
+        &swap_chain_handle,
+        &directx_device,
+        &actual_feature_level,
+        &directx_device_context);
+    assert(result == S_OK);
+
+    swap_chain_dsv_texture_desc: Texture_Description;
+    swap_chain_dsv_texture_desc.width = window.width;
+    swap_chain_dsv_texture_desc.height = window.height;
+    swap_chain_dsv_texture_desc.format = .DEPTH_STENCIL;
+    swap_chain_dsv_texture_desc.render_target = true;
+    swap_chain_dsv_texture = create_texture(swap_chain_dsv_texture_desc);
+
+    // Backface cull rasterizer
+    backface_cull_rasterizer_desc: D3D11_RASTERIZER_DESC;
+    backface_cull_rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+    backface_cull_rasterizer_desc.CullMode = D3D11_CULL_BACK;
+    backface_cull_rasterizer_desc.DepthClipEnable = .TRUE;
+    result = directx_device.CreateRasterizerState(directx_device, &backface_cull_rasterizer_desc, &directx_backface_cull_rasterizer);
+    assert(result == S_OK);
+
+    // create no cull rasterizer
+    no_cull_rasterizer_desc: D3D11_RASTERIZER_DESC;
+    no_cull_rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+    no_cull_rasterizer_desc.CullMode = D3D11_CULL_NONE;
+    result = directx_device.CreateRasterizerState(directx_device, &no_cull_rasterizer_desc, &directx_no_cull_rasterizer);
+    assert(result == S_OK);
+
+    // create depth test state
+    depth_test_stencil_desc: D3D11_DEPTH_STENCIL_DESC;
+    depth_test_stencil_desc.DepthEnable                  = .TRUE;
+    depth_test_stencil_desc.DepthWriteMask               = D3D11_DEPTH_WRITE_MASK_ALL;
+    depth_test_stencil_desc.DepthFunc                    = D3D11_COMPARISON_LESS_EQUAL;
+    depth_test_stencil_desc.StencilEnable                = .TRUE;
+    depth_test_stencil_desc.StencilReadMask              = 0xff;
+    depth_test_stencil_desc.StencilWriteMask             = 0xff;
+    depth_test_stencil_desc.FrontFace.StencilFunc        = D3D11_COMPARISON_ALWAYS;
+    depth_test_stencil_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+    depth_test_stencil_desc.FrontFace.StencilPassOp      = D3D11_STENCIL_OP_KEEP;
+    depth_test_stencil_desc.FrontFace.StencilFailOp      = D3D11_STENCIL_OP_KEEP;
+    depth_test_stencil_desc.BackFace.StencilFunc         = D3D11_COMPARISON_ALWAYS;
+    depth_test_stencil_desc.BackFace.StencilDepthFailOp  = D3D11_STENCIL_OP_KEEP;
+    depth_test_stencil_desc.BackFace.StencilPassOp       = D3D11_STENCIL_OP_KEEP;
+    depth_test_stencil_desc.BackFace.StencilFailOp       = D3D11_STENCIL_OP_KEEP;
+    result = directx_device.CreateDepthStencilState(directx_device, &depth_test_stencil_desc, &directx_depth_test_state);
+    assert(result == S_OK);
+
+    // create no depth test state
+    no_depth_test_stencil_desc := depth_test_stencil_desc;
+    no_depth_test_stencil_desc.DepthEnable = .FALSE;
+    no_depth_test_stencil_desc.DepthFunc   = D3D11_COMPARISON_ALWAYS;
+    result = directx_device.CreateDepthStencilState(directx_device, &no_depth_test_stencil_desc, &directx_no_depth_test_state);
+    assert(result == S_OK);
+
+    // create linear wrap sampler
+    linear_wrap_sampler_desc: D3D11_SAMPLER_DESC;
+    linear_wrap_sampler_desc.Filter   = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    linear_wrap_sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+    linear_wrap_sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+    linear_wrap_sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    linear_wrap_sampler_desc.MinLOD = -F32_MAX;
+    linear_wrap_sampler_desc.MaxLOD = F32_MAX;
+    result = directx_device.CreateSamplerState(directx_device, &linear_wrap_sampler_desc, &linear_wrap_sampler);
+    assert(result == S_OK);
+
+    // create linear wrap sampler
+    directx_linear_clamp_sampler_desc: D3D11_SAMPLER_DESC;
+    directx_linear_clamp_sampler_desc.Filter   = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    directx_linear_clamp_sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    directx_linear_clamp_sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    directx_linear_clamp_sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    directx_linear_clamp_sampler_desc.MinLOD = -F32_MAX;
+    directx_linear_clamp_sampler_desc.MaxLOD = F32_MAX;
+    result = directx_device.CreateSamplerState(directx_device, &directx_linear_clamp_sampler_desc, &directx_linear_clamp_sampler);
+    assert(result == S_OK);
+
+    // create point wrap sampler
+    directx_point_wrap_sampler_desc: D3D11_SAMPLER_DESC;
+    directx_point_wrap_sampler_desc.Filter   = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    directx_point_wrap_sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+    directx_point_wrap_sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+    directx_point_wrap_sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    directx_point_wrap_sampler_desc.MinLOD = -F32_MAX;
+    directx_point_wrap_sampler_desc.MaxLOD = F32_MAX;
+    result = directx_device.CreateSamplerState(directx_device, &directx_point_wrap_sampler_desc, &directx_point_wrap_sampler);
+    assert(result == S_OK);
+
+    // create point clamp sampler
+    directx_point_clamp_sampler_desc: D3D11_SAMPLER_DESC;
+    directx_point_clamp_sampler_desc.Filter   = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    directx_point_clamp_sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    directx_point_clamp_sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    directx_point_clamp_sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    directx_point_clamp_sampler_desc.MinLOD = -F32_MAX;
+    directx_point_clamp_sampler_desc.MaxLOD = F32_MAX;
+    result = directx_device.CreateSamplerState(directx_device, &directx_point_clamp_sampler_desc, &directx_point_clamp_sampler);
+    assert(result == S_OK);
+
+    // create alpha blend state
+    alpha_blend_desc: D3D11_BLEND_DESC;
+    alpha_blend_desc.RenderTarget[0].BlendEnable    = .TRUE;
+    alpha_blend_desc.RenderTarget[0].SrcBlend       = D3D11_BLEND_SRC_ALPHA;
+    alpha_blend_desc.RenderTarget[0].DestBlend      = D3D11_BLEND_INV_SRC_ALPHA;
+    alpha_blend_desc.RenderTarget[0].BlendOp        = D3D11_BLEND_OP_ADD;
+    alpha_blend_desc.RenderTarget[0].SrcBlendAlpha  = D3D11_BLEND_SRC_ALPHA;
+    alpha_blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    alpha_blend_desc.RenderTarget[0].BlendOpAlpha   = D3D11_BLEND_OP_ADD;
+    alpha_blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    result = directx_device.CreateBlendState(directx_device, &alpha_blend_desc, &directx_alpha_blend_state);
+    assert(result == S_OK);
+}
+
+proc dx_create_render_target_view(backing_texture: ^ID3D11Texture2D, format: Texture_Format) : ^ID3D11RenderTargetView {
+    assert(format != .INVALID);
+    render_target_view_desc: D3D11_RENDER_TARGET_VIEW_DESC;
+    render_target_view_desc.Format        = dx_texture_format_mapping[cast(int, format)];
+    render_target_view_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    render_target_view: ^ID3D11RenderTargetView;
+    result := directx_device.CreateRenderTargetView(directx_device, cast(^ID3D11Resource, backing_texture), &render_target_view_desc, &render_target_view);
+    assert(result == S_OK);
+    return render_target_view;
+}
+
+proc dx_create_depth_stencil_view(backing_texture: ^ID3D11Texture2D, format: Texture_Format) : ^ID3D11DepthStencilView {
+    assert(format != .INVALID);
+    assert(texture_format_infos[cast(int, format)].is_depth_format);
+    depth_stencil_view_desc: D3D11_DEPTH_STENCIL_VIEW_DESC;
+    depth_stencil_view_desc.Format = dx_texture_format_mapping[cast(int, format)];
+    depth_stencil_view_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    depth_stencil_view: ^ID3D11DepthStencilView;
+    result := directx_device.CreateDepthStencilView(directx_device, cast(^ID3D11Resource, backing_texture), null, &depth_stencil_view);
+    assert(result == S_OK);
+    return depth_stencil_view;
+}
+
+proc ensure_swap_chain_size(width: int, height: int) {
+    assert(width > 0);
+    assert(height > 0);
+    if (swap_chain_width != width || swap_chain_height != height) {
+        result := swap_chain_handle.ResizeBuffers(swap_chain_handle, SWAP_CHAIN_BUFFER_COUNT, cast(u32, width), cast(u32, height), dx_texture_format_mapping[cast(int, SWAP_CHAIN_FORMAT)], 0);
+        assert(result == S_OK);
+        swap_chain_width  = width;
+        swap_chain_height = height;
+        ensure_texture_size(&swap_chain_dsv_texture, width, height);
+    }
+}
+
+
+
+proc set_viewport(x: float, y: float, width: float, height: float, min_depth: float, max_depth: float) {
+    viewport: D3D11_VIEWPORT;
+    viewport.TopLeftX = x;
+    viewport.TopLeftY = y;
+    viewport.Width    = width;
+    viewport.Height   = height;
+    viewport.MinDepth = min_depth;
+    viewport.MaxDepth = max_depth;
+    directx_device_context.RSSetViewports(directx_device_context, 1, &viewport);
+}
+
+proc set_depth_test(depth_test: bool) {
+    if (depth_test) directx_device_context.OMSetDepthStencilState(directx_device_context, directx_depth_test_state, 0);
+    else            directx_device_context.OMSetDepthStencilState(directx_device_context, directx_no_depth_test_state, 0);
+}
+
+proc set_primitive_topology(pt: Primitive_Topology) {
+    if (pt == .TRIANGLE_LIST)       directx_device_context.IASetPrimitiveTopology(directx_device_context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    else if (pt == .TRIANGLE_STRIP) directx_device_context.IASetPrimitiveTopology(directx_device_context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    else if (pt == .LINE_LIST)      directx_device_context.IASetPrimitiveTopology(directx_device_context, D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+    else if (pt == .LINE_STRIP)     directx_device_context.IASetPrimitiveTopology(directx_device_context, D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP);
+    else {
+        print("Unknown Primitive_Topology: %\n", pt);
+        assert(false);
+    }
+}
+
+proc set_rasterizer_mode(rm: Rasterizer_Mode) {
+    if (rm == .NO_CULL)                       directx_device_context.RSSetState(directx_device_context, directx_no_cull_rasterizer);
+    else if (rm == .BACKFACE_CULL)            directx_device_context.RSSetState(directx_device_context, directx_backface_cull_rasterizer);
+    // else if (rm == .FRONTFACE_CULL)           directx_device_context.RSSetState(directx_device_context, directx_frontface_cull_rasterizer);
+    // else if (rm == .NO_CULL_WIREFRAME)        directx_device_context.RSSetState(directx_device_context, directx_no_cull_wireframe_rasterizer);
+    // else if (rm == .BACKFACE_CULL_WIREFRAME)  directx_device_context.RSSetState(directx_device_context, directx_backface_cull_wireframe_rasterizer);
+    // else if (rm == .FRONTFACE_CULL_WIREFRAME) directx_device_context.RSSetState(directx_device_context, directx_frontface_cull_wireframe_rasterizer);
+    else {
+        print("Unknown Rasterizer_Mode: %\n", rm);
+        assert(false);
+    }
+}
+
+proc set_blend_mode(bm: Blend_Mode) {
+    blend_factor := [4]FLOAT.{1, 1, 1, 1};
+    if (bm == .DEFAULT)       directx_device_context.OMSetBlendState(directx_device_context, directx_alpha_blend_state, &blend_factor[0], 0xffffffff);
+    // else if (bm == .NO_BLEND) directx_device_context.OMSetBlendState(directx_device_context, directx_no_alpha_blend_state, blend_factor, 0xffffffff);
+    // else if (bm == .TEXT)     directx_device_context.OMSetBlendState(directx_device_context, directx_text_alpha_blend_state, blend_factor, 0xffffffff);
+    else {
+        print("Unknown Blend_Mode: %\n", bm);
+        assert(false);
+    }
+}
+
+
+
+// Buffers
+
+proc create_vertex_buffer(data: rawptr, len: int) : Vertex_Buffer {
+    buffer_desc: D3D11_BUFFER_DESC;
+    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+    buffer_desc.ByteWidth = cast(u32, len);
+    buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+
+    buffer_data: D3D11_SUBRESOURCE_DATA;
+    buffer_data.pSysMem = data;
+
+    ptr_buffer: ^D3D11_SUBRESOURCE_DATA;
+    if (data != null) {
+        ptr_buffer = &buffer_data;
+    }
+    buffer: ^ID3D11Buffer;
+    result := directx_device.CreateBuffer(directx_device, &buffer_desc, ptr_buffer, &buffer);
+    assert(result == S_OK);
+    return .{buffer};
+}
+
+proc bind_vertex_buffers(buffers: []Vertex_Buffer, start_slot: u32, strides: []u32, offsets: []u32) {
+    assert(buffers.count > 0);
+    assert(buffers.count == strides.count);
+    assert(buffers.count == offsets.count);
+    #assert(sizeof(Vertex_Buffer) == sizeof(^ID3D11Buffer));
+    directx_device_context.IASetVertexBuffers(directx_device_context, start_slot, cast(u32, buffers.count), cast(^^ID3D11Buffer, &buffers[0]), &strides[0], &offsets[0]);
+}
+
+proc update_vertex_buffer(buffer: Vertex_Buffer, data: rawptr, len: int) {
+    directx_device_context.UpdateSubresource(directx_device_context, cast(^ID3D11Resource, buffer.buf), 0, null, data, cast(u32, len), 0);
+}
+
+proc destroy_vertex_buffer(buffer: Vertex_Buffer) {
+    buffer.buf.Release(buffer.buf);
+}
+
+
+
+proc create_index_buffer(data: rawptr, len: int) : Index_Buffer {
+    buffer_desc: D3D11_BUFFER_DESC;
+    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+    buffer_desc.ByteWidth = cast(u32, len);
+    buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+
+    buffer_data: D3D11_SUBRESOURCE_DATA;
+    buffer_data.pSysMem = data;
+
+    ptr_buffer: ^D3D11_SUBRESOURCE_DATA;
+    if (data != null) {
+        ptr_buffer = &buffer_data;
+    }
+    buffer: ^ID3D11Buffer;
+    result := directx_device.CreateBuffer(directx_device, &buffer_desc, ptr_buffer, &buffer);
+    assert(result == S_OK);
+    return .{buffer};
+}
+
+proc bind_index_buffer(buffer: Index_Buffer, slot: u32) {
+    // todo(josh): parameterize index buffers
+    #assert(sizeof(Index_Buffer) == sizeof(^ID3D11Buffer));
+    directx_device_context.IASetIndexBuffer(directx_device_context, buffer.buf, DXGI_FORMAT_R32_UINT, slot);
+}
+
+proc update_index_buffer(buffer: Index_Buffer, data: rawptr, len: int) {
+    directx_device_context.UpdateSubresource(directx_device_context, cast(^ID3D11Resource, buffer.buf), 0, null, data, cast(u32, len), 0);
+}
+
+proc destroy_index_buffer(buffer: Index_Buffer) {
+    buffer.buf.Release(buffer.buf);
+}
+
+
+
+proc create_constant_buffer(data: rawptr, len: int) : Constant_Buffer {
+    buffer_desc: D3D11_BUFFER_DESC;
+    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+    buffer_desc.ByteWidth = cast(u32, len);
+    buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+    buffer_data: D3D11_SUBRESOURCE_DATA;
+    buffer_data.pSysMem = data;
+
+    ptr_buffer: ^D3D11_SUBRESOURCE_DATA;
+    if (data != null) {
+        ptr_buffer = &buffer_data;
+    }
+    buffer: ^ID3D11Buffer;
+    result := directx_device.CreateBuffer(directx_device, &buffer_desc, ptr_buffer, &buffer);
+    assert(result == S_OK);
+    return .{buffer};
+}
+
+proc bind_constant_buffers(buffers: []Constant_Buffer, start_slot: u32) {
+    #assert(sizeof(Constant_Buffer) == sizeof(^ID3D11Buffer));
+    directx_device_context.VSSetConstantBuffers(directx_device_context, start_slot, cast(u32, buffers.count), cast(^^ID3D11Buffer, &buffers[0]));
+    directx_device_context.PSSetConstantBuffers(directx_device_context, start_slot, cast(u32, buffers.count), cast(^^ID3D11Buffer, &buffers[0]));
+    directx_device_context.CSSetConstantBuffers(directx_device_context, start_slot, cast(u32, buffers.count), cast(^^ID3D11Buffer, &buffers[0]));
+}
+
+proc update_constant_buffer(buffer: Constant_Buffer, data: rawptr, len: int) {
+    directx_device_context.UpdateSubresource(directx_device_context, cast(^ID3D11Resource, buffer.buf), 0, null, data, cast(u32, len), 0);
+}
+
+proc destroy_constant_buffer(buffer: Constant_Buffer) {
+    buffer.buf.Release(buffer.buf);
+}
+
+
+
+// Shaders
+
+const D3D_SHADER_COMPILE_FLAGS := D3DCOMPILE_DEBUG | D3DCOMPILE_WARNINGS_ARE_ERRORS;
+
+proc compile_vertex_shader_from_file(filename: string, out_blob: ^^ID3D10Blob, allocator: Allocator) : ^ID3D11VertexShader {
+    errors: ^ID3D10Blob;
+    vertex_shader_blob: ^ID3D10Blob;
+    success: bool;
+    result_length_in_bytes: i32;
+    filename_wide := to_wide_string(filename, allocator, &success, &result_length_in_bytes);
+    defer sif_free(filename_wide, allocator);
+    result := D3DCompileFromFile(filename_wide, cast(rawptr, 0), cast(^ID3DInclude, 1), "main", "vs_5_0", D3D_SHADER_COMPILE_FLAGS, 0, &vertex_shader_blob, &errors);
+    if (errors != null) {
+        str := cast(cstring, errors.GetBufferPointer(errors));
+        print(string_ptr(str, cast(i64, strlen(str))));
+        assert(false);
+    }
+    assert(result == S_OK);
+    vertex_shader_handle: ^ID3D11VertexShader;
+    result = directx_device.CreateVertexShader(directx_device, vertex_shader_blob.GetBufferPointer(vertex_shader_blob), vertex_shader_blob.GetBufferSize(vertex_shader_blob), null, &vertex_shader_handle);
+    assert(result == S_OK);
+    if (errors != null) errors.Release(errors);
+    out_blob^ = vertex_shader_blob;
+    return vertex_shader_handle;
+}
+
+proc compile_pixel_shader_from_file(filename: string, allocator: Allocator) : ^ID3D11PixelShader {
+    errors: ^ID3D10Blob;
+    pixel_shader_blob: ^ID3D10Blob;
+    success: bool;
+    result_length_in_bytes: i32;
+    filename_wide := to_wide_string(filename, allocator, &success, &result_length_in_bytes);
+    defer sif_free(filename_wide, allocator);
+    result := D3DCompileFromFile(filename_wide, cast(rawptr, 0), cast(^ID3DInclude, 1), "main", "ps_5_0", D3D_SHADER_COMPILE_FLAGS, 0, &pixel_shader_blob, &errors);
+    if (errors != null) {
+        str := cast(cstring, errors.GetBufferPointer(errors));
+        print(string_ptr(str, cast(i64, strlen(str))));
+        assert(false);
+    }
+    assert(result == S_OK);
+    pixel_shader: ^ID3D11PixelShader;
+    result = directx_device.CreatePixelShader(directx_device, pixel_shader_blob.GetBufferPointer(pixel_shader_blob), pixel_shader_blob.GetBufferSize(pixel_shader_blob), null, &pixel_shader);
+    assert(result == S_OK);
+    if (errors != null) errors.Release(errors);
+    pixel_shader_blob.Release(pixel_shader_blob);
+    return pixel_shader;
+}
+
+proc bind_shaders(vertex: ^ID3D11VertexShader, pixel: ^ID3D11PixelShader) {
+    directx_device_context.VSSetShader(directx_device_context, vertex, null, 0);
+    directx_device_context.PSSetShader(directx_device_context, pixel, null, 0);
+}
+
+
+
+// Textures
+
+proc create_texture(desc: Texture_Description) : Texture {
+    // todo(josh): check for max texture size?
+    assert(desc.width > 0);
+    assert(desc.height > 0);
+
+    if (desc.type == .INVALID) {
+        desc.type = .TEXTURE2D;
+    }
+
+    if (desc.format == .INVALID) {
+        desc.format = .R8G8B8A8_UINT;
+    }
+
+    if (desc.wrap_mode == .INVALID) {
+        desc.wrap_mode = .POINT_CLAMP;
+    }
+
+    if (desc.mipmap_count == 0) {
+        desc.mipmap_count = 1;
+    }
+
+    assert(desc.mipmap_count <= 1);
+
+    texture_format := dx_texture_format_mapping[cast(int, desc.format)]; // @EnumArrays
+
+    texture_handle_2d: ^ID3D11Texture2D;
+    texture_handle_3d: ^ID3D11Texture3D;
+    uav:               ^ID3D11UnorderedAccessView;
+    if (desc.type == .TEXTURE2D) {
+        // Create texture
+        texture_desc: D3D11_TEXTURE2D_DESC;
+        texture_desc.Width            = cast(u32, desc.width);
+        texture_desc.Height           = cast(u32, desc.height);
+        texture_desc.MipLevels        = cast(u32, desc.mipmap_count);
+        texture_desc.Format           = texture_format;
+        texture_desc.SampleDesc.Count = 1;
+        texture_desc.ArraySize        = 1;
+        if (desc.cpu_read_target) {
+            texture_desc.Usage = D3D11_USAGE_STAGING;
+            texture_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        }
+        else {
+            texture_desc.Usage = D3D11_USAGE_DEFAULT;
+        }
+
+        if (texture_format_infos[cast(int, desc.format)].is_depth_format) { // @EnumArrays
+            texture_desc.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+        }
+        else {
+            if (!desc.cpu_read_target) {
+                texture_desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+            }
+            if (desc.uav) {
+                texture_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+            }
+            if (desc.render_target) {
+                texture_desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
+            }
+        }
+
+        pixel_size := cast(u32, texture_format_infos[cast(int, desc.format)].pixel_size_in_bytes); // @EnumArrays
+        subresource_data := [6]D3D11_SUBRESOURCE_DATA.{
+            .{desc.color_data, pixel_size * cast(u32, desc.width),    0},
+            .{desc.color_data, pixel_size * cast(u32, desc.width/2),  0},
+            .{desc.color_data, pixel_size * cast(u32, desc.width/4),  0},
+            .{desc.color_data, pixel_size * cast(u32, desc.width/8),  0},
+            .{desc.color_data, pixel_size * cast(u32, desc.width/16), 0},
+            .{desc.color_data, pixel_size * cast(u32, desc.width/32), 0},
+        };
+
+        subresource_ptr: ^D3D11_SUBRESOURCE_DATA;
+        if (desc.color_data != null) {
+            subresource_ptr = &subresource_data[0];
+        }
+        result := directx_device.CreateTexture2D(directx_device, &texture_desc, subresource_ptr, &texture_handle_2d);
+        assert(result == S_OK);
+    }
+    // else if (desc.type == .TEXTURE3D) {
+    //     // Create texture
+    //     D3D11_TEXTURE3D_DESC texture_desc = {};
+    //     texture_desc.Width     = (u32)desc.width;
+    //     texture_desc.Height    = (u32)desc.height;
+    //     texture_desc.Depth     = (u32)desc.depth;
+    //     texture_desc.MipLevels = desc.mipmap_count;
+    //     texture_desc.Format    = texture_format;
+    //     texture_desc.Usage     = D3D11_USAGE_DEFAULT;
+
+    //     if (texture_format_infos[desc.format].is_depth_format) {
+    //         texture_desc.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+    //     }
+    //     else {
+    //         texture_desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    //         if (desc.uav) {
+    //             texture_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+    //         }
+    //         if (desc.render_target) {
+    //             texture_desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
+    //         }
+    //     }
+
+    //     u32 pixel_size = (u32)texture_format_infos[desc.format].pixel_size_in_bytes;
+    //     D3D11_SUBRESOURCE_DATA subresource_data[6] = {
+    //         {desc.color_data, pixel_size * (u32)desc.width,    pixel_size * ((u32)desc.width)    * ((u32)desc.height)   },
+    //         {desc.color_data, pixel_size * (u32)desc.width/2,  pixel_size * ((u32)desc.width/2)  * ((u32)desc.height/2) },
+    //         {desc.color_data, pixel_size * (u32)desc.width/4,  pixel_size * ((u32)desc.width/4)  * ((u32)desc.height/4) },
+    //         {desc.color_data, pixel_size * (u32)desc.width/8,  pixel_size * ((u32)desc.width/8)  * ((u32)desc.height/8) },
+    //         {desc.color_data, pixel_size * (u32)desc.width/16, pixel_size * ((u32)desc.width/16) * ((u32)desc.height/16)},
+    //         {desc.color_data, pixel_size * (u32)desc.width/32, pixel_size * ((u32)desc.width/32) * ((u32)desc.height/32)},
+    //     };
+
+    //     auto result = directx_device->CreateTexture3D(&texture_desc, desc.color_data == null ? null : &subresource_data[0], &texture_handle_3d);
+    //     assert(result == S_OK);
+    // }
+    // else if (desc.type == .CUBEMAP) {
+    //     // Create texture
+    //     D3D11_TEXTURE2D_DESC texture_desc = {};
+    //     texture_desc.Width            = (u32)desc.width;
+    //     texture_desc.Height           = (u32)desc.height;
+    //     texture_desc.MipLevels        = desc.mipmap_count;
+    //     texture_desc.Format           = texture_format;
+    //     texture_desc.SampleDesc.Count = 1;
+    //     texture_desc.Usage            = D3D11_USAGE_DEFAULT;
+    //     texture_desc.ArraySize        = 6;
+    //     texture_desc.MiscFlags        |= D3D11_RESOURCE_MISC_TEXTURECUBE;
+
+    //     if (texture_format_infos[desc.format].is_depth_format) {
+    //         texture_desc.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+    //     }
+    //     else {
+    //         texture_desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    //         if (desc.uav) {
+    //             texture_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+    //         }
+    //         if (desc.render_target) {
+    //             texture_desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
+    //         }
+    //     }
+
+    //     u32 pixel_size = (u32)texture_format_infos[desc.format].pixel_size_in_bytes;
+    //     D3D11_SUBRESOURCE_DATA subresource_data[6] = {
+    //         {desc.color_data, pixel_size * (u32)desc.width,    0},
+    //         {desc.color_data, pixel_size * (u32)desc.width/2,  0},
+    //         {desc.color_data, pixel_size * (u32)desc.width/4,  0},
+    //         {desc.color_data, pixel_size * (u32)desc.width/8,  0},
+    //         {desc.color_data, pixel_size * (u32)desc.width/16, 0},
+    //         {desc.color_data, pixel_size * (u32)desc.width/32, 0},
+    //     };
+
+    //     auto result = directx_device->CreateTexture2D(&texture_desc, desc.color_data == null ? null : &subresource_data[0], &texture_handle_2d);
+    //     assert(result == S_OK);
+    // }
+    else {
+        print("Unhandled case: %\n", desc.type);
+        assert(false);
+    }
+
+    texture: Texture;
+    texture.valid = true;
+    texture.description = desc;
+    texture.backend.handle_2d = texture_handle_2d;
+    texture.backend.handle_3d = texture_handle_3d;
+    texture.backend.uav = uav;
+    return texture;
+}
+
+proc destroy_texture(texture: Texture) {
+    if (texture.backend.handle_2d != null) {
+        texture.backend.handle_2d.Release(texture.backend.handle_2d);
+    }
+    if (texture.backend.handle_3d != null) {
+        texture.backend.handle_3d.Release(texture.backend.handle_3d);
+    }
+    if (texture.backend.shader_resource_view != null) {
+        texture.backend.shader_resource_view.Release(texture.backend.shader_resource_view);
+    }
+    if (texture.backend.uav != null) {
+        texture.backend.uav.Release(texture.backend.uav);
+    }
+}
+
+proc ensure_texture_size(texture: ^Texture, width: int, height: int) {
+    assert(width != 0);
+    assert(height != 0);
+
+    if (texture.description.width != width || texture.description.height != height) {
+        desc := texture.description;
+        destroy_texture(texture^);
+        desc.width  = width;
+        desc.height = height;
+        texture^ = create_texture(desc);
+    }
+}
+
+proc dx_create_shader_resource_view(texture: Texture) : ^ID3D11ShaderResourceView {
+    assert(!texture_format_infos[cast(int, texture.description.format)].is_depth_format);
+    shader_resource_view: ^ID3D11ShaderResourceView;
+    if (texture.description.type == .TEXTURE2D) {
+        texture_shader_resource_desc: D3D11_SHADER_RESOURCE_VIEW_DESC;
+        texture_shader_resource_desc.Format = dx_texture_format_mapping[cast(int, texture.description.format)];
+        texture_shader_resource_desc.Texture2D.MipLevels = cast(u32, texture.description.mipmap_count);
+        texture_shader_resource_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        result := directx_device.CreateShaderResourceView(directx_device, cast(^ID3D11Resource, texture.backend.handle_2d), &texture_shader_resource_desc, &shader_resource_view);
+        assert(result == S_OK);
+    }
+    else {
+        print("Unhandled texture type: %\n", texture.description.type);
+        assert(false);
+    }
+        // case TT_3D: {
+        //     D3D11_SHADER_RESOURCE_VIEW_DESC texture_shader_resource_desc = {};
+        //     texture_shader_resource_desc.Format = dx_texture_format_mapping[texture.description.format];
+        //     texture_shader_resource_desc.Texture3D.MipLevels = texture.description.mipmap_count;
+        //     texture_shader_resource_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+        //     auto result = directx_device->CreateShaderResourceView((ID3D11Resource *)texture.backend.handle_3d, &texture_shader_resource_desc, &shader_resource_view);
+        //     ASSERT(result == S_OK);
+        //     break;
+        // }
+        // case TT_CUBEMAP: {
+        //     D3D11_SHADER_RESOURCE_VIEW_DESC texture_shader_resource_desc = {};
+        //     texture_shader_resource_desc.Format = dx_texture_format_mapping[texture.description.format];
+        //     texture_shader_resource_desc.TextureCube.MipLevels = texture.description.mipmap_count;
+        //     texture_shader_resource_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+        //     auto result = directx_device->CreateShaderResourceView((ID3D11Resource *)texture.backend.handle_2d, &texture_shader_resource_desc, &shader_resource_view);
+        //     ASSERT(result == S_OK);
+        //     break;
+        // }
+        // default: {
+        //     ASSERT(false);
+        // }
+    assert(shader_resource_view != null);
+    return shader_resource_view;
+}
+
+proc bind_texture(texture: Texture, slot: int) {
+    assert(slot < MAX_BOUND_TEXTURES);
+    if (directx_cur_srvs[slot] != null) {
+        directx_cur_srvs[slot].Release(directx_cur_srvs[slot]);
+        directx_cur_srvs[slot] = null;
+    }
+
+    if (texture.valid) {
+        directx_cur_srvs[slot] = dx_create_shader_resource_view(texture);
+        if (texture.description.wrap_mode == Texture_Wrap_Mode.LINEAR_CLAMP) {
+            directx_device_context.PSSetSamplers(directx_device_context, 0, 1, &directx_linear_wrap_sampler);
+        }
+        else if (texture.description.wrap_mode == Texture_Wrap_Mode.LINEAR_CLAMP) {
+            directx_device_context.PSSetSamplers(directx_device_context, 0, 1, &directx_linear_clamp_sampler);
+        }
+        else if (texture.description.wrap_mode == Texture_Wrap_Mode.POINT_WRAP) {
+            directx_device_context.PSSetSamplers(directx_device_context, 0, 1, &directx_point_wrap_sampler);
+        }
+        else if (texture.description.wrap_mode == Texture_Wrap_Mode.POINT_CLAMP) {
+            directx_device_context.PSSetSamplers(directx_device_context, 0, 1, &directx_point_clamp_sampler);
+        }
+        else {
+            print("Unhandle texture wrap mode: %\n", texture.description.wrap_mode);
+            assert(false);
+        }
+    }
+    directx_device_context.PSSetShaderResources(directx_device_context, cast(u32, slot), 1, &directx_cur_srvs[slot]);
+}
+
+
+
+proc set_render_targets(bindings: Render_Target_Bindings) {
+    unset_render_targets();
+
+    for (idx := 0; idx < bindings.color_bindings.count; idx += 1) {
+        color_buffer := bindings.color_bindings[idx].texture;
+        clear := bindings.color_bindings[idx].clear;
+        clear_color := bindings.color_bindings[idx].clear_color;
+
+        assert(directx_cur_rtvs[idx] == null);
+
+        if (color_buffer.valid) {
+            assert(color_buffer.description.type == .TEXTURE2D);
+            assert(color_buffer.description.render_target);
+            directx_current_render_targets[idx] = color_buffer;
+            directx_cur_rtvs[idx] = dx_create_render_target_view(color_buffer.backend.handle_2d, color_buffer.description.format);
+        }
+        else {
+            if (idx == 0) {
+                // bind the swapchain as the render target
+                backing_texture: ^ID3D11Texture2D;
+                texture_2d_uid := uid(ID3D11Texture2D.uuid);
+                result := swap_chain_handle.GetBuffer(swap_chain_handle, 0, &texture_2d_uid, cast(^rawptr, &backing_texture));
+                assert(result == S_OK);
+                assert(directx_cur_rtvs[0] == null);
+                directx_cur_rtvs[0] = dx_create_render_target_view(backing_texture, SWAP_CHAIN_RTV_FORMAT);
+                backing_texture.Release(backing_texture);
+            }
+        }
+
+        if (directx_cur_rtvs[idx] != null && clear) {
+            color_elements := [4]float.{clear_color.x, clear_color.y, clear_color.z, clear_color.w};
+            directx_device_context.ClearRenderTargetView(directx_device_context, directx_cur_rtvs[idx], &color_elements[0]);
+        }
+    }
+
+    depth_binding := bindings.depth_binding;
+    depth_buffer_to_use := &swap_chain_dsv_texture;
+    if (depth_binding.texture.valid) {
+        depth_buffer_to_use = &depth_binding.texture;
+    }
+
+    assert(directx_cur_dsv == null);
+    assert(depth_buffer_to_use != null);
+    assert(depth_buffer_to_use.description.type == .TEXTURE2D);
+    assert(depth_buffer_to_use.description.render_target);
+    directx_cur_dsv = dx_create_depth_stencil_view(depth_buffer_to_use.backend.handle_2d, depth_buffer_to_use.description.format);
+    if (depth_binding.clear) {
+        directx_device_context.ClearDepthStencilView(directx_device_context, directx_cur_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, depth_binding.clear_depth, 0);
+    }
+
+    directx_device_context.OMSetRenderTargets(directx_device_context, MAX_BOUND_RENDER_TARGETS, &directx_cur_rtvs[0], directx_cur_dsv);
+}
+
+proc unset_render_targets() {
+    for (i := 0; i < MAX_BOUND_RENDER_TARGETS; i += 1) {
+        rtv := directx_cur_rtvs[i];
+        if (directx_cur_rtvs[i] != null) {
+            target := directx_current_render_targets[i];
+            if (target.valid) {
+                assert(target.description.type == .TEXTURE2D);
+                assert(target.description.render_target);
+                directx_current_render_targets[i] = .{};
+            }
+
+            directx_cur_rtvs[i].Release(directx_cur_rtvs[i]);
+            directx_cur_rtvs[i] = null;
+        }
+    }
+    if (directx_cur_dsv != null) {
+        directx_cur_dsv.Release(directx_cur_dsv);
+        directx_cur_dsv = null;
+    }
+}
+
+
+
+proc issue_draw_call(first_vertex: int, vertex_count: int, first_index: int, index_count: int, instance_count: int) {
+    if (instance_count == 0) {
+        if (index_count > 0) {
+            directx_device_context.DrawIndexed(directx_device_context, cast(u32, index_count), cast(u32, first_index), cast(i32, first_vertex));
+        }
+        else {
+            directx_device_context.Draw(directx_device_context, cast(u32, vertex_count), cast(u32, first_vertex));
+        }
+    }
+    else {
+        if (index_count > 0) {
+            directx_device_context.DrawIndexedInstanced(directx_device_context, cast(u32, index_count), cast(u32, instance_count), cast(u32, first_index), 0, 0);
+        }
+        else {
+            directx_device_context.DrawInstanced(directx_device_context, cast(u32, vertex_count), cast(u32, instance_count), cast(u32, first_vertex), 0);
+        }
+    }
+}
+
+proc present_to_screen(vsync: bool) {
+    swap_chain_handle.Present(swap_chain_handle, cast(u32, transmute(byte, vsync)), 0);
+}

@@ -1,0 +1,822 @@
+#include "core:basic.sif"
+#include "core:dynamic_array.sif"
+#include "core:windows.sif"
+#include "core:math.sif"
+#include "core:directx/d3d11.sif"
+#include "core:time.sif"
+#include "core:os.sif"
+#include "core:random.sif"
+
+#include "platform.sif"
+#include "external/stb/stb_image.sif"
+#include "external/stb/stb_truetype.sif"
+#include "render_backend.sif"
+
+struct Vertex {
+    position: Vector3;
+    uv:       Vector3;
+    color:    Vector4;
+}
+
+struct Model {
+    allocator: Allocator;
+    triangle_list_infos: []Triangle_List_Info;
+    vertex_buffer: Vertex_Buffer;
+    index_buffer: Index_Buffer;
+    vertices: []Vertex;
+    indices:  []u32;
+}
+
+struct Triangle_List_Info {
+    first_vertex: int;
+    vertex_count: int;
+    has_indices: bool;
+    first_index: int;
+    index_count: int;
+
+    // material:      PBR_Material;
+    // has_material:  bool;
+}
+
+struct Render_Pass_Constant_Buffer {
+    screen_dimensions: Vector2;
+    pad1: [2]float;
+    view_matrix: Matrix4;
+    projection_matrix: Matrix4;
+    camera_position: Vector3;
+    pad2: [1]float;
+}
+
+struct Model_Constant_Buffer {
+    model: Matrix4;
+    color: Vector4;
+}
+
+g_model_cbuffer_handle: Constant_Buffer;
+g_quad_model: Model;
+
+proc main() {
+    init_platform();
+    window := create_window("My Cool Window", 1920, 1080);
+    init_render_backend(&window);
+
+    roboto := load_font_from_file("resources/fonts/roboto.ttf", 48, default_allocator());
+
+    vertex_shader_blob: ^ID3D10Blob;
+    vertex_shader         := compile_vertex_shader_from_file("basic_vertex.hlsl", &vertex_shader_blob, default_allocator());
+    pixel_shader          := compile_pixel_shader_from_file("basic_pixel.hlsl", default_allocator());
+    pixel_shader_textured := compile_pixel_shader_from_file("basic_pixel_textured.hlsl", default_allocator());
+    text_pixel_shader     := compile_pixel_shader_from_file("text_pixel.hlsl", default_allocator());
+
+    white_texture_desc: Texture_Description;
+    white_texture_desc.width = 1;
+    white_texture_desc.height = 1;
+    white_texture_desc.format = .R8G8B8A8_UINT;
+    white_texture_pixel := [4]byte.{255, 255, 255, 255};
+    white_texture_desc.color_data = &white_texture_pixel[0];
+    white_texture := create_texture(white_texture_desc);
+
+    black_texture_desc: Texture_Description;
+    black_texture_desc.width = 1;
+    black_texture_desc.height = 1;
+    black_texture_desc.format = .R8G8B8A8_UINT;
+    black_texture_pixel := [4]byte.{0, 0, 0, 255};
+    black_texture_desc.color_data = &black_texture_pixel[0];
+    black_texture := create_texture(black_texture_desc);
+
+    test_texture: Texture;
+    {
+        w: i32;
+        h: i32;
+        c: i32;
+        texture_name := "test_texture.png";
+        texture_data := stbi_load(&texture_name[0], &w, &h, &c, 4);
+        assert(c == 4);
+        assert(texture_data != null);
+
+        test_texture_desc: Texture_Description;
+        test_texture_desc.width  = cast(int, w);
+        test_texture_desc.height = cast(int, h);
+        test_texture_desc.format = .R8G8B8A8_UINT;
+        test_texture_desc.type = .TEXTURE2D;
+        test_texture_desc.color_data = texture_data;
+        test_texture = create_texture(test_texture_desc);
+    }
+
+    vertex_fields := [3]D3D11_INPUT_ELEMENT_DESC.{
+        .{"SV_POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0},
+        .{"TEXCOORD",    0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        .{"COLOR",       0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+
+    vertex_format: ^ID3D11InputLayout;
+    result := directx_device.CreateInputLayout(directx_device, &vertex_fields[0], 3, vertex_shader_blob.GetBufferPointer(vertex_shader_blob), vertex_shader_blob.GetBufferSize(vertex_shader_blob), &vertex_format);
+    assert(result == S_OK);
+    vertex_shader_blob.Release(vertex_shader_blob);
+
+
+
+    cube_model := create_cube_model(default_allocator());
+    g_quad_model := create_quad_model(default_allocator());
+
+    g_model_cbuffer_handle = create_constant_buffer(null, sizeof(Model_Constant_Buffer));
+    render_pass_cbuffer_handle := create_constant_buffer(null, sizeof(Render_Pass_Constant_Buffer));
+
+
+
+    assert(load_texture_from_file("resources/plane1.png",      &g_plane_texture_1));
+    assert(load_texture_from_file("resources/plane2.png",      &g_plane_texture_2));
+    assert(load_texture_from_file("resources/plane3.png",      &g_plane_texture_3));
+    assert(load_texture_from_file("resources/rock_bottom.png", &g_rock_bottom_texture));
+    assert(load_texture_from_file("resources/rock_top.png",    &g_rock_top_texture));
+    assert(load_texture_from_file("resources/foreground.png",  &g_foreground_texture));
+    assert(load_texture_from_file("resources/background.png",  &g_background_texture));
+
+
+
+    rand: Random_State;
+    init_random_state(&rand, 7238723);
+
+    camera: Camera;
+    camera.position = Vector3.{0, 0, -10};
+    camera.orientation = Quaternion.identity();
+    camera.size = 4.5;
+
+    entity_manager: Entity_Manager;
+    init_entity_manager(&entity_manager, default_allocator());
+
+    player := make_entity(&entity_manager, Plane);
+    player.position.x = -4;
+    player.scale = Vector3.{1, cast(float, g_plane_texture_1.description.height) / cast(float, g_plane_texture_1.description.width), 1};
+    player.texture = g_plane_texture_1;
+
+    background_scale := Vector3.{1, cast(float, g_background_texture.description.height) / cast(float, g_background_texture.description.width), 1} * 17;
+    foreground_scale := Vector3.{1, cast(float, g_foreground_texture.description.height) / cast(float, g_foreground_texture.description.width), 1} * 17;
+
+    background_parallax_1 := make_entity(&entity_manager, Empty_Entity);
+    background_parallax_1.position.z = 5;
+    background_parallax_1.texture = g_background_texture;
+    background_parallax_1.scale = background_scale;
+    background_parallax_2 := make_entity(&entity_manager, Empty_Entity);
+    background_parallax_2.position.z = 5;
+    background_parallax_2.texture = g_background_texture;
+    background_parallax_2.scale = background_scale;
+    foreground_parallax_1 := make_entity(&entity_manager, Empty_Entity);
+    foreground_parallax_1.position.z = -1;
+    foreground_parallax_1.position.y = -4.2;
+    foreground_parallax_1.texture = g_foreground_texture;
+    foreground_parallax_1.scale = foreground_scale;
+    foreground_parallax_2 := make_entity(&entity_manager, Empty_Entity);
+    foreground_parallax_2.position.z = -1;
+    foreground_parallax_2.position.y = -4.2;
+    foreground_parallax_2.texture = g_foreground_texture;
+    foreground_parallax_2.scale = foreground_scale;
+
+    const ROCK_TIME := 3;
+    cur_rock_time: float;
+
+
+
+    game_loop_timer: Timer;
+    init_timer(&game_loop_timer);
+    game_loop_start_time := get_time(game_loop_timer);
+    last_frame_start_time := game_loop_start_time;
+    while (!window.should_close) {
+        frame_start_time := get_time(game_loop_timer) - game_loop_start_time;
+        defer last_frame_start_time = frame_start_time;
+        dt := cast(f32, frame_start_time - last_frame_start_time);
+
+        update_window(&window);
+        if (get_input(&window.inputs, .ESCAPE)) {
+            break;
+        }
+
+        cur_rock_time -= dt;
+        if (cur_rock_time <= 0) {
+            cur_rock_time += ROCK_TIME;
+            posy := random_float32_range(-2, 2, &rand);
+            top    := make_entity(&entity_manager, Rock);
+            top.texture = g_rock_top_texture;
+            top.position = .{20, posy+4.5, 1};
+            top.scale = Vector3.{1, cast(float, g_rock_top_texture.description.height) / cast(float, g_rock_top_texture.description.width), 1} * 3;
+            bottom := make_entity(&entity_manager, Rock);
+            bottom.texture = g_rock_bottom_texture;
+            bottom.position = .{20, posy+-4.5, 1};
+            bottom.scale = Vector3.{1, cast(float, g_rock_bottom_texture.description.height) / cast(float, g_rock_bottom_texture.description.width), 1} * 3;
+        }
+
+        const BACKGROUND_PARALLAX_SPEED := 0.1;
+        background_parallax_1.position.x = lerp(background_scale.x, -background_scale.x, cast(f32, fmod((frame_start_time * BACKGROUND_PARALLAX_SPEED)      , 5) / 5));
+        background_parallax_2.position.x = lerp(background_scale.x, -background_scale.x, cast(f32, fmod((2.5 + frame_start_time * BACKGROUND_PARALLAX_SPEED), 5) / 5));
+
+        const FOREGROUND_PARALLAX_SPEED := 1.1;
+        foreground_parallax_1.position.x = lerp(foreground_scale.x, -foreground_scale.x, cast(f32, fmod((frame_start_time * FOREGROUND_PARALLAX_SPEED)      , 5) / 5));
+        foreground_parallax_2.position.x = lerp(foreground_scale.x, -foreground_scale.x, cast(f32, fmod((2.5 + frame_start_time * FOREGROUND_PARALLAX_SPEED), 5) / 5));
+
+        //
+        for (i := 0; i < entity_manager.all_entities.count; i += 1) {
+            entity := &entity_manager.all_entities[i];
+            if (entity.id == 0) {
+                continue;
+            }
+
+            if (entity.kind == Plane) {
+                plane := cast(^Plane, entity);
+                if (get_input_down(&window.inputs, .SPACE)) {
+                    plane.velocity.y = 7;
+                }
+                const GRAVITY := 25;
+                plane.velocity.y -= GRAVITY * dt;
+                plane.position = plane.position + (plane.velocity * dt);
+                plane.orientation = axis_angle(.{0, 0, 1}, to_radians(plane.velocity.y * 3));
+            }
+            else if (entity.kind == Rock) {
+                const ROCK_SPEED := 5;
+                rock := cast(^Rock, entity);
+                rock.position.x -= ROCK_SPEED * dt;
+
+                if (overlap_rect_rect(.{player.position.x, player.position.y},
+                                      .{player.scale.x, player.scale.y},
+                                      .{rock.position.x, rock.position.y},
+                                      .{0.05, rock.scale.y})) {
+                    printa(frame_start_time);
+                }
+            }
+        }
+
+
+
+        ensure_swap_chain_size(window.width, window.height);
+
+        bindings: Render_Target_Bindings;
+        bindings.color_bindings[0] = .{.{}, true, .{0.39, 0.58, 0.93, 1}};
+        bindings.depth_binding     = .{.{}, true, 1};
+        set_render_targets(bindings);
+
+        render_pass_cbuffer: Render_Pass_Constant_Buffer;
+        render_pass_cbuffer.screen_dimensions = window.size;
+        render_pass_cbuffer.view_matrix       = construct_view_matrix(camera.position, camera.orientation);
+        render_pass_cbuffer.projection_matrix = construct_camera_projection_matrix(&camera, window.size.x / window.size.y);
+        render_pass_cbuffer.camera_position   = camera.position;
+        update_constant_buffer(render_pass_cbuffer_handle, &render_pass_cbuffer, sizeof(Render_Pass_Constant_Buffer));
+
+        bind_constant_buffers(slice_ptr(&render_pass_cbuffer_handle, 1), 0);
+        bind_constant_buffers(slice_ptr(&g_model_cbuffer_handle,     1), 1);
+
+        directx_device_context.IASetInputLayout(directx_device_context, vertex_format);
+
+        set_viewport(0, 0, cast(f32, window.width), cast(f32, window.height), 0, 1);
+        set_depth_test(true);
+        set_rasterizer_mode(.BACKFACE_CULL);
+        set_blend_mode(.DEFAULT);
+        set_primitive_topology(.TRIANGLE_LIST);
+
+        ff_array := make_dynamic_array(Vertex, 10 * 1024, default_allocator());
+        defer destroy_dynamic_array(ff_array);
+
+        ff: Fixed_Function;
+        ff_begin(&ff, &ff_array);
+        defer ff_end(&ff);
+
+        // draw entities
+        {
+            // this alloc+copy is silly
+            sorted := new_slice(Entity, entity_manager.all_entities.count, default_allocator());
+            defer delete_slice(sorted, default_allocator());
+            copy_slice(sorted, entity_manager.all_entities);
+
+            proc sort_proc(a: Entity, b: Entity) : int {
+                if (a.position.z > b.position.z) {
+                    return -1;
+                }
+                return 1;
+            }
+
+            quick_sort(sorted, sort_proc);
+
+            bind_shaders(vertex_shader, pixel_shader_textured);
+            for (i := 0; i < sorted.count; i += 1) {
+                entity := &sorted[i];
+                if (entity.id == 0) {
+                    continue;
+                }
+
+                if (entity.texture.valid) {
+                    bind_texture(entity.texture, 0);
+                    draw_model(g_quad_model, entity.position, entity.scale, entity.orientation, .{1, 1, 1, 1});
+                }
+            }
+        }
+
+        present_to_screen(true);
+        unset_render_targets();
+    }
+}
+
+g_plane_texture_1: Texture;
+g_plane_texture_2: Texture;
+g_plane_texture_3: Texture;
+g_rock_bottom_texture: Texture;
+g_rock_top_texture: Texture;
+g_foreground_texture: Texture;
+g_background_texture: Texture;
+
+
+
+struct Camera {
+    position: Vector3;
+    orientation: Quaternion;
+    size: float;
+    is_perspective: bool;
+}
+
+struct Entity_Manager {
+    all_entities: []Entity;
+    entities_freelist: Dynamic_Array!(u32);
+    num_entities_ever_made: u32;
+}
+
+const EntityID := u64;
+
+struct Entity {
+    using derived: union {
+        plane: Plane;
+    };
+    manager: ^Entity_Manager;
+    id: EntityID;
+    position: Vector3;
+    orientation: Quaternion;
+    scale: Vector3;
+    kind: typeid;
+    texture: Texture;
+    target_position: Vector3;
+    can_push: bool;
+    can_be_pushed: bool;
+}
+
+struct Plane {
+    using base: ^Entity;
+    velocity: Vector3;
+}
+
+struct Rock {
+    using base: ^Entity;
+}
+
+struct Empty_Entity {
+    using base: ^Entity;
+}
+
+proc init_entity_manager(using manager: ^Entity_Manager, allocator: Allocator) {
+    const MAX_ENTITIES := 1024;
+    all_entities = new_slice(Entity, MAX_ENTITIES, allocator);
+    entities_freelist = make_dynamic_array(u32, MAX_ENTITIES, allocator);
+    for (i := MAX_ENTITIES-1; i >= 0; i -= 1) {
+        append(&entities_freelist, cast(u32, i));
+    }
+}
+
+proc make_entity(using manager: ^Entity_Manager, $Type: typeid) : ^Type {
+    num_entities_ever_made += 1;
+    slot := pop(&entities_freelist);
+    id := encode_entity_id(slot, num_entities_ever_made);
+
+    base := &all_entities[cast(int, slot)];
+    zero_pointer(base, sizeof(Entity));
+    base.id = id;
+    base.orientation = Quaternion.identity();
+    base.scale = .{1, 1, 1};
+    base.manager = manager;
+    base.kind = Type;
+    t := cast(^Type, &base.derived);
+    t.base = base;
+    return t;
+}
+
+proc destroy_entity(entity: ^Entity) {
+    entity.id = 0;
+}
+
+// proc clear_scene(using manager: ^Entity_Manager) {
+//     for (i := 0; i < all_entities.count; i += 1) {
+//         if (all_entities[i].id != 0) {
+//             append(&entities_freelist, cast(u32, i));
+//         }
+//     }
+// }
+
+proc encode_entity_id(idx: u32, gen: u32) : EntityID {
+    id := cast(u64, idx) << 32 | cast(u64, gen);
+    return cast(EntityID, id);
+}
+
+proc decode_entity_id(id: EntityID, out_idx: ^u32, out_gen: ^u32) {
+    out_idx^ = cast(u32, id >> 32);
+    out_gen^ = cast(u32, id);
+}
+
+proc get_entity(using manager: ^Entity_Manager, id: EntityID) : ^Entity {
+    idx: u32;
+    gen: u32;
+    decode_entity_id(id, &idx, &gen);
+    entity := &all_entities[cast(int, idx)];
+    if (entity.id != id) {
+        return null;
+    }
+    return entity;
+}
+
+proc get_entity_typed(using manager: ^Entity_Manager, id: EntityID, $T: typeid) : ^T {
+    entity := get_entity(gameboard, id);
+    if (entity == null) {
+        return null;
+    }
+    if (entity.kind != T) {
+        return null;
+    }
+    return cast(^T, entity);
+}
+
+
+
+proc overlap_rect_rect(pos1: Vector2, size1: Vector2, pos2: Vector2, size2: Vector2) : bool {
+    left1  := pos1.x - (size1.x / 2);
+    right1 := pos1.x + (size1.x / 2);
+    bottom1 := pos1.y - (size1.y / 2);
+    top1    := pos1.y + (size1.y / 2);
+
+    left2  := pos2.x - (size2.x / 2);
+    right2 := pos2.x + (size2.x / 2);
+    bottom2 := pos2.y - (size2.y / 2);
+    top2    := pos2.y + (size2.y / 2);
+
+    return left1 < right2 && right1 > left2 && top1 > bottom2 && bottom1 < top2;
+}
+
+proc udf_rect(query_position: Vector2, rect_position: Vector2, rect_size: Vector2) : float {
+    dx := max(fabsf(query_position.x - rect_position.x) - rect_size.x / 2, 0);
+    dy := max(fabsf(query_position.y - rect_position.y) - rect_size.y / 2, 0);
+    return dx * dx + dy * dy;
+}
+
+
+
+proc load_texture_from_file(filename: string, out_texture: ^Texture) : bool {
+    w: i32;
+    h: i32;
+    c: i32;
+    texture_data := stbi_load(&filename[0], &w, &h, &c, 4);
+    if (texture_data == null) {
+        return false;
+    }
+    assert(c == 4);
+
+    desc: Texture_Description;
+    desc.width  = cast(int, w);
+    desc.height = cast(int, h);
+    desc.format = .R8G8B8A8_UINT;
+    desc.type = .TEXTURE2D;
+    desc.color_data = texture_data;
+    out_texture^ = create_texture(desc);
+    return true;
+}
+
+
+
+proc draw_model(model: Model, position: Vector3, scale: Vector3, orientation: Quaternion, color: Vector4) {
+    flush_model_cbuffer(position, scale, orientation, color);
+
+    stride: u32 = sizeof(Vertex);
+    offset: u32 = 0;
+    bind_vertex_buffers(slice_ptr(&model.vertex_buffer, 1), 0, slice_ptr(&stride, 1), slice_ptr(&offset, 1));
+    bind_index_buffer(model.index_buffer, 0);
+
+    for (i := 0; i < model.triangle_list_infos.count; i += 1) {
+        info := model.triangle_list_infos[i];
+        issue_draw_call(info.first_vertex, info.vertex_count, info.first_index, info.index_count, 0);
+    }
+}
+
+proc flush_model_cbuffer(position: Vector3, scale: Vector3, orientation: Quaternion, color: Vector4) {
+    model_cbuffer: Model_Constant_Buffer;
+    model_cbuffer.model = construct_trs_matrix(position, orientation, scale);
+    model_cbuffer.color = color;
+    update_constant_buffer(g_model_cbuffer_handle, &model_cbuffer, sizeof(Model_Constant_Buffer));
+}
+
+proc draw_single_vertex_buffer(buffer: Vertex_Buffer, count: int) {
+    stride: u32 = sizeof(Vertex);
+    offset: u32 = 0;
+    bind_vertex_buffers(slice_ptr(&buffer, 1), 0, slice_ptr(&stride, 1), slice_ptr(&offset, 1));
+    issue_draw_call(0, count, 0, 0, 0);
+}
+
+
+
+
+
+proc create_model(vertices: []Vertex, indices: []u32, triangle_list_infos: []Triangle_List_Info, allocator: Allocator) : Model {
+    vertex_buffer := create_vertex_buffer(&vertices[0], sizeof(typeof(vertices[0])) * vertices.count);
+    index_buffer: Index_Buffer;
+    if (indices.count > 0) {
+        index_buffer = create_index_buffer(&indices[0], sizeof(typeof(indices[0])) * indices.count);
+    }
+
+    m: Model;
+    m.triangle_list_infos = new_slice(Triangle_List_Info, triangle_list_infos.count, allocator); copy_slice(m.triangle_list_infos, triangle_list_infos);
+    m.vertices = new_slice(Vertex, vertices.count, allocator);
+    copy_slice(m.vertices, vertices);
+    if (indices.count > 0) {
+        m.indices = new_slice(u32, indices.count, allocator);
+        copy_slice(m.indices, indices);
+    }
+    m.vertex_buffer = vertex_buffer;
+    m.index_buffer = index_buffer;
+    m.allocator = allocator;
+    return m;
+}
+
+proc create_cube_model(allocator: Allocator) : Model {
+    // make cube model
+    // u32 cube_indices[36] = {
+    //      0,  2,  1,  0,  3,  2,
+    //      4,  5,  6,  4,  6,  7,
+    //      8, 10,  9,  8, 11, 10,
+    //     12, 13, 14, 12, 14, 15,
+    //     16, 17, 18, 16, 18, 19,
+    //     20, 22, 21, 20, 23, 22,
+    // };
+
+    vertices := [36]Vertex.{
+        .{.{-0.5, -0.5, -0.5}, .{0, 1, 0}, .{1, 1, 1, 1}}, //{ 0,  0, -1}, { 1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 0
+        .{.{ 0.5,  0.5, -0.5}, .{1, 0, 0}, .{1, 1, 1, 1}}, //{ 0,  0, -1}, { 1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 2
+        .{.{ 0.5, -0.5, -0.5}, .{1, 1, 0}, .{1, 1, 1, 1}}, //{ 0,  0, -1}, { 1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 1
+        .{.{-0.5, -0.5, -0.5}, .{0, 1, 0}, .{1, 1, 1, 1}}, //{ 0,  0, -1}, { 1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 0
+        .{.{-0.5,  0.5, -0.5}, .{0, 0, 0}, .{1, 1, 1, 1}}, //{ 0,  0, -1}, { 1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 3
+        .{.{ 0.5,  0.5, -0.5}, .{1, 0, 0}, .{1, 1, 1, 1}}, //{ 0,  0, -1}, { 1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 2
+
+        .{.{-0.5, -0.5,  0.5}, .{1, 1, 0}, .{1, 1, 1, 1}}, //{ 0,  0,  1}, {-1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 4
+        .{.{ 0.5, -0.5,  0.5}, .{0, 1, 0}, .{1, 1, 1, 1}}, //{ 0,  0,  1}, {-1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 5
+        .{.{ 0.5,  0.5,  0.5}, .{0, 0, 0}, .{1, 1, 1, 1}}, //{ 0,  0,  1}, {-1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 6
+        .{.{-0.5, -0.5,  0.5}, .{1, 1, 0}, .{1, 1, 1, 1}}, //{ 0,  0,  1}, {-1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 4
+        .{.{ 0.5,  0.5,  0.5}, .{0, 0, 0}, .{1, 1, 1, 1}}, //{ 0,  0,  1}, {-1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 6
+        .{.{-0.5,  0.5,  0.5}, .{1, 0, 0}, .{1, 1, 1, 1}}, //{ 0,  0,  1}, {-1,  0,  0}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 7
+
+        .{.{-0.5, -0.5, -0.5}, .{1, 1, 0}, .{1, 1, 1, 1}}, //{-1,  0,  0}, { 0,  0, -1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 8
+        .{.{-0.5,  0.5,  0.5}, .{0, 0, 0}, .{1, 1, 1, 1}}, //{-1,  0,  0}, { 0,  0, -1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 10
+        .{.{-0.5,  0.5, -0.5}, .{1, 0, 0}, .{1, 1, 1, 1}}, //{-1,  0,  0}, { 0,  0, -1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 9
+        .{.{-0.5, -0.5, -0.5}, .{1, 1, 0}, .{1, 1, 1, 1}}, //{-1,  0,  0}, { 0,  0, -1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 8
+        .{.{-0.5, -0.5,  0.5}, .{0, 1, 0}, .{1, 1, 1, 1}}, //{-1,  0,  0}, { 0,  0, -1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 11
+        .{.{-0.5,  0.5,  0.5}, .{0, 0, 0}, .{1, 1, 1, 1}}, //{-1,  0,  0}, { 0,  0, -1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 10
+
+        .{.{ 0.5, -0.5, -0.5}, .{0, 1, 0}, .{1, 1, 1, 1}}, //{ 1,  0,  0}, { 0,  0,  1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 12
+        .{.{ 0.5,  0.5, -0.5}, .{0, 0, 0}, .{1, 1, 1, 1}}, //{ 1,  0,  0}, { 0,  0,  1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 13
+        .{.{ 0.5,  0.5,  0.5}, .{1, 0, 0}, .{1, 1, 1, 1}}, //{ 1,  0,  0}, { 0,  0,  1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 14
+        .{.{ 0.5, -0.5, -0.5}, .{0, 1, 0}, .{1, 1, 1, 1}}, //{ 1,  0,  0}, { 0,  0,  1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 12
+        .{.{ 0.5,  0.5,  0.5}, .{1, 0, 0}, .{1, 1, 1, 1}}, //{ 1,  0,  0}, { 0,  0,  1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 14
+        .{.{ 0.5, -0.5,  0.5}, .{1, 1, 0}, .{1, 1, 1, 1}}, //{ 1,  0,  0}, { 0,  0,  1}, { 0,  1,  0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 15
+
+        .{.{-0.5, -0.5, -0.5}, .{1, 1 ,0}, .{1, 1, 1, 1}}, //{ 0, -1,  0}, { 1,  0,  0}, { 0,  0, -1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 16
+        .{.{ 0.5, -0.5, -0.5}, .{0, 1, 0}, .{1, 1, 1, 1}}, //{ 0, -1,  0}, { 1,  0,  0}, { 0,  0, -1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 17
+        .{.{ 0.5, -0.5,  0.5}, .{0, 0, 0}, .{1, 1, 1, 1}}, //{ 0, -1,  0}, { 1,  0,  0}, { 0,  0, -1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 18
+        .{.{-0.5, -0.5, -0.5}, .{1, 1 ,0}, .{1, 1, 1, 1}}, //{ 0, -1,  0}, { 1,  0,  0}, { 0,  0, -1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 16
+        .{.{ 0.5, -0.5,  0.5}, .{0, 0, 0}, .{1, 1, 1, 1}}, //{ 0, -1,  0}, { 1,  0,  0}, { 0,  0, -1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 18
+        .{.{-0.5, -0.5,  0.5}, .{1, 0, 0}, .{1, 1, 1, 1}}, //{ 0, -1,  0}, { 1,  0,  0}, { 0,  0, -1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 19
+
+        .{.{-0.5,  0.5, -0.5}, .{1, 0, 0}, .{1, 1, 1, 1}}, //{ 0,  1,  0}, { 1,  0,  0}, { 0,  0,  1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 20
+        .{.{ 0.5,  0.5,  0.5}, .{0, 1, 0}, .{1, 1, 1, 1}}, //{ 0,  1,  0}, { 1,  0,  0}, { 0,  0,  1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 22
+        .{.{ 0.5,  0.5, -0.5}, .{0, 0, 0}, .{1, 1, 1, 1}}, //{ 0,  1,  0}, { 1,  0,  0}, { 0,  0,  1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 21
+        .{.{-0.5,  0.5, -0.5}, .{1, 0, 0}, .{1, 1, 1, 1}}, //{ 0,  1,  0}, { 1,  0,  0}, { 0,  0,  1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 20
+        .{.{-0.5,  0.5,  0.5}, .{1, 1, 0}, .{1, 1, 1, 1}}, //{ 0,  1,  0}, { 1,  0,  0}, { 0,  0,  1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 23
+        .{.{ 0.5,  0.5,  0.5}, .{0, 1, 0}, .{1, 1, 1, 1}}, //{ 0,  1,  0}, { 1,  0,  0}, { 0,  0,  1}, {0, 0, 0, 0}, {0, 0, 0, 0}}, // 22
+    };
+
+    triangle_list_info: Triangle_List_Info;
+    triangle_list_info.first_vertex = 0;
+    triangle_list_info.vertex_count = vertices.count;
+    triangle_list_info.has_indices  = false;
+    model := create_model(to_slice(&vertices), .{}, slice_ptr(&triangle_list_info, 1), allocator);
+    return model;
+}
+
+proc create_quad_model(allocator: Allocator) : Model {
+    vertices := [6]Vertex.{
+        .{.{-0.5, -0.5, 0}, .{0, 1, 0}, .{1, 1, 1, 1}},
+        .{.{ 0.5,  0.5, 0}, .{1, 0, 0}, .{1, 1, 1, 1}},
+        .{.{ 0.5, -0.5, 0}, .{1, 1, 0}, .{1, 1, 1, 1}},
+        .{.{-0.5, -0.5, 0}, .{0, 1, 0}, .{1, 1, 1, 1}},
+        .{.{-0.5,  0.5, 0}, .{0, 0, 0}, .{1, 1, 1, 1}},
+        .{.{ 0.5,  0.5, 0}, .{1, 0, 0}, .{1, 1, 1, 1}},
+    };
+
+    triangle_list_info: Triangle_List_Info;
+    triangle_list_info.first_vertex = 0;
+    triangle_list_info.vertex_count = vertices.count;
+    triangle_list_info.has_indices  = false;
+    model := create_model(to_slice(&vertices), .{}, slice_ptr(&triangle_list_info, 1), allocator);
+    return model;
+}
+
+
+
+proc construct_camera_projection_matrix(camera: ^Camera, aspect: float) : Matrix4 {
+    if (camera.is_perspective) {
+        return construct_perspective_matrix(to_radians(camera.size), aspect, 0.01, 1000);
+    }
+    else {
+        return construct_orthographic_matrix(-camera.size * aspect, camera.size * aspect, -camera.size, camera.size, -100, 100);
+    }
+}
+
+proc get_mouse_world_position(camera: ^Camera, camera_aspect: float, mouse_position_unit: Vector2) : Vector3 {
+    viewport := unit_to_viewport(Vector3.{mouse_position_unit.x, mouse_position_unit.y, 0});
+    cursor_viewport_position := Vector4.{viewport.x, viewport.y, viewport.z, 1};
+
+    proj := construct_camera_projection_matrix(camera, camera_aspect);
+    view := construct_view_matrix(camera.position, camera.orientation);
+    inv  := Matrix4.inverse(proj * view);
+
+    cursor_world_position4 := inv * cursor_viewport_position;
+    if (cursor_world_position4.w != 0) {
+        cursor_world_position4 = cursor_world_position4 / cursor_world_position4.w;
+    }
+    cursor_world_position := Vector3.{cursor_world_position4.x, cursor_world_position4.y, cursor_world_position4.z};
+    return cursor_world_position;
+}
+
+proc get_mouse_direction_from_camera(camera: ^Camera, camera_aspect: float, mouse_position_unit: Vector2) : Vector3 {
+    if (!camera.is_perspective) {
+        return Quaternion.forward(camera.orientation);
+    }
+
+    cursor_world_position := get_mouse_world_position(camera, camera_aspect, mouse_position_unit);
+    cursor_direction := Vector3.normalize(cursor_world_position - camera.position);
+    return cursor_direction;
+}
+
+proc unit_to_viewport(a: Vector3) : Vector3 {
+    result := (a * 2) - Vector3.{1, 1, 0};
+    return result;
+}
+
+
+
+struct Fixed_Function {
+    array: ^Dynamic_Array!(Vertex);
+    vertex_buffer: Vertex_Buffer;
+    current_vertex: ^Vertex;
+};
+
+proc ff_begin(ff: ^Fixed_Function, array: ^Dynamic_Array!(Vertex)) {
+    ff.array = array;
+}
+
+proc ff_end(ff: ^Fixed_Function) {
+    ff_flush(ff);
+}
+
+proc ff_flush(ff: ^Fixed_Function) {
+    if (ff.array.count == 0) {
+        return;
+    }
+
+    vertex_buffer := create_vertex_buffer(ff.array.elements.data, sizeof(typeof(ff.array^[0])) * ff.array.count);
+    flush_model_cbuffer(.{}, .{1, 1, 1}, Quaternion.identity(), .{1, 1, 1, 1});
+    draw_single_vertex_buffer(vertex_buffer, ff.array.count);
+    destroy_vertex_buffer(vertex_buffer);
+    clear_dynamic_array(ff.array);
+    ff.current_vertex = null;
+}
+
+proc ff_vertex(ff: ^Fixed_Function, position: Vector3) {
+    v: Vertex;
+    v.position = position;
+    ff.current_vertex = append(ff.array, v);
+}
+
+proc ff_uv(ff: ^Fixed_Function, uv: Vector3) {
+    assert(ff.current_vertex != null);
+    ff.current_vertex.uv = uv;
+}
+
+proc ff_color(ff: ^Fixed_Function, color: Vector4) {
+    assert(ff.current_vertex != null);
+    ff.current_vertex.color = color;
+}
+
+proc ff_quad_uvs(ff: ^Fixed_Function, min: Vector3, max: Vector3, color: Vector4, uvs: [2]Vector3) {
+    ff_vertex(ff, .{min.x, min.y, 0}); ff_uv(ff, .{uvs[0].x, uvs[0].y, uvs[0].z}); ff_color(ff, color);
+    ff_vertex(ff, .{min.x, max.y, 0}); ff_uv(ff, .{uvs[0].x, uvs[1].y, uvs[0].z}); ff_color(ff, color);
+    ff_vertex(ff, .{max.x, max.y, 0}); ff_uv(ff, .{uvs[1].x, uvs[1].y, uvs[0].z}); ff_color(ff, color);
+    ff_vertex(ff, .{max.x, max.y, 0}); ff_uv(ff, .{uvs[1].x, uvs[1].y, uvs[0].z}); ff_color(ff, color);
+    ff_vertex(ff, .{max.x, min.y, 0}); ff_uv(ff, .{uvs[1].x, uvs[0].y, uvs[0].z}); ff_color(ff, color);
+    ff_vertex(ff, .{min.x, min.y, 0}); ff_uv(ff, .{uvs[0].x, uvs[0].y, uvs[0].z}); ff_color(ff, color);
+}
+
+proc ff_quad(ff: ^Fixed_Function, min: Vector3, max: Vector3, color: Vector4) {
+    uvs := [2]Vector3.{
+        .{0, 1, 0},
+        .{1, 0, 0},
+    };
+    ff_quad_uvs(ff, min, max, color, uvs);
+}
+
+proc ff_text(ff: ^Fixed_Function, str: string, font: Font, color: Vector4, start_pos: Vector3, size: float) {
+    position: Vector3;
+    for (idx := 0; idx < str.count; idx += 1) {
+        c := str[idx];
+        if (c == '\n') {
+            position.x = 0;
+            position.y += font.pixel_height * size;
+            continue;
+        }
+
+        quad: stbtt_aligned_quad;
+        stbtt_GetBakedQuad(&font.chars[0], cast(i32, font.dim), cast(i32, font.dim), cast(i32, c), &position.x, &position.y, &quad, 1);//1=opengl & d3d10+,0=d3d9
+        x0 := start_pos.x + quad.x0 * size;
+        y0 := start_pos.y + quad.y0 * size;
+        x1 := start_pos.x + quad.x1 * size;
+        y1 := start_pos.y + quad.y1 * size;
+        miny := start_pos.y - (y1 - start_pos.y);
+        character_height := y1 - y0;
+        uvs := [2]Vector3.{
+            .{quad.s0, quad.t1, 0},
+            .{quad.s1, quad.t0, 0},
+        };
+        ff_quad_uvs(ff, Vector3.{x0, miny, start_pos.z}, Vector3.{x1, miny + character_height, start_pos.z}, color, uvs);
+    }
+}
+
+proc get_string_width(str: string, font: Font, size: float) : float {
+    position: Vector3;
+    highest_x: float;
+    for (idx := 0; idx < str.count; idx += 1) {
+        c := str[idx];
+        if (c == '\n') {
+            position.x = 0;
+            position.y += font.pixel_height * size;
+            continue;
+        }
+        quad: stbtt_aligned_quad;
+        stbtt_GetBakedQuad(&font.chars[0], cast(i32, font.dim), cast(i32, font.dim), cast(i32, c), &position.x, &position.y, &quad, 1);
+        highest_x = max(highest_x, position.x);
+    }
+    return highest_x * size;
+}
+
+struct Font {
+    texture:      Texture;
+    chars:        [128]stbtt_bakedchar;
+    dim:          int;
+    pixel_height: float;
+}
+
+proc load_font_from_file(filename: string, size: float, allocator: Allocator) : Font {
+    ttf_data := read_entire_file(filename, allocator);
+    if (ttf_data.data == null) {
+        print("load_font_from_file() couldn't find file: %\n", filename);
+        return .{};
+    }
+    defer delete_slice(ttf_data, allocator);
+
+    font: Font;
+    font.pixel_height = size;
+    font.dim = 256;
+    pixels: ^byte;
+    defer sif_free(pixels, default_allocator());
+    tries: int;
+    while (true) {
+        if (tries >= 5) {
+            print("Failed to create font after a bunch of tries.\n");
+            assert(false);
+        }
+        tries += 1;
+        // todo(josh): check for max texture size for GPU?
+
+        pixels = cast(^byte, sif_alloc(font.dim * font.dim, DEFAULT_ALIGNMENT, default_allocator()));
+        ret := stbtt_BakeFontBitmap(ttf_data.data, 0, size, pixels, cast(i32, font.dim), cast(i32, font.dim), 0, cast(i32, font.chars.count), &font.chars[0]);
+        if (ret < 0) {
+            sif_free(pixels, default_allocator());
+            font.dim = cast(int, cast(float, font.dim) * 1.5);
+        }
+        else {
+            break;
+        }
+    }
+
+    assert(pixels != null);
+
+    desc: Texture_Description;
+    desc.type = .TEXTURE2D;
+    desc.width = font.dim;
+    desc.height = font.dim;
+    desc.format = .R8_UINT;
+    desc.wrap_mode = .POINT_CLAMP;
+    desc.color_data = pixels;
+    font.texture = create_texture(desc);
+    return font;
+}
+
+proc destroy_font(font: Font) {
+    destroy_texture(font.texture);
+}

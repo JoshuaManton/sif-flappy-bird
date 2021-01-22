@@ -1,0 +1,530 @@
+#include "core:windows.sif"
+
+struct Window {
+    should_close: bool;
+
+    width: int;
+    height: int;
+    aspect: float;
+    size: Vector2;
+
+    is_focused: bool;
+
+    mouse_position_unit: Vector2;
+    mouse_position_pixel: Vector2;
+    mouse_position_pixel_delta: Vector2;
+    mouse_scroll: float;
+
+    updated_at_least_once: bool;
+
+    using inputs: Inputs;
+
+    handle: HWND;
+    dc: HDC;
+
+    mouse_capture_sum: int;
+}
+
+struct Inputs {
+    inputs_held: [cast(int, Input.COUNT)]bool;
+    inputs_down: [cast(int, Input.COUNT)]bool;
+    inputs_up:   [cast(int, Input.COUNT)]bool;
+}
+
+proc get_input(inputs: ^Inputs, input: Input) : bool {
+    if (inputs == null) {
+        return false;
+    }
+    return inputs.inputs_held[cast(int, input)]; // @EnumArrays
+}
+
+proc get_input_down(inputs: ^Inputs, input: Input) : bool {
+    if (inputs == null) {
+        return false;
+    }
+    return inputs.inputs_down[cast(int, input)]; // @EnumArrays
+}
+
+proc get_input_up(inputs: ^Inputs, input: Input) : bool {
+    if (inputs == null) {
+        return false;
+    }
+    return inputs.inputs_up[cast(int, input)]; // @EnumArrays
+}
+
+windows_key_mapping: [256]Input;
+g_currently_processing_window: ^Window;
+
+proc init_platform() {
+    windows_key_mapping[0x01] = .MOUSE_LEFT;
+    windows_key_mapping[0x02] = .MOUSE_RIGHT;
+    windows_key_mapping[0x04] = .MOUSE_MIDDLE;
+
+    windows_key_mapping[0x08] = .BACKSPACE;
+    windows_key_mapping[0x09] = .TAB;
+
+    windows_key_mapping[0x0C] = .CLEAR;
+    windows_key_mapping[0x0D] = .ENTER;
+
+    windows_key_mapping[0x10] = .SHIFT;
+    windows_key_mapping[0x11] = .CONTROL;
+    windows_key_mapping[0x12] = .ALT;
+    windows_key_mapping[0x13] = .PAUSE;
+    windows_key_mapping[0x14] = .CAPS_LOCK;
+
+    windows_key_mapping[0x1B] = .ESCAPE;
+
+    windows_key_mapping[0x20] = .SPACE;
+    windows_key_mapping[0x21] = .PAGE_UP;
+    windows_key_mapping[0x22] = .PAGE_DOWN;
+    windows_key_mapping[0x23] = .END;
+    windows_key_mapping[0x24] = .HOME;
+    windows_key_mapping[0x25] = .LEFT;
+    windows_key_mapping[0x26] = .UP;
+    windows_key_mapping[0x27] = .RIGHT;
+    windows_key_mapping[0x28] = .DOWN;
+    windows_key_mapping[0x29] = .SELECT;
+    windows_key_mapping[0x2A] = .PRINT;
+    windows_key_mapping[0x2B] = .EXECUTE;
+    windows_key_mapping[0x2C] = .PRINT_SCREEN;
+    windows_key_mapping[0x2D] = .INSERT;
+    windows_key_mapping[0x2E] = .DELETE;
+    windows_key_mapping[0x2F] = .HELP;
+
+    windows_key_mapping[cast(int, '1')] = .NR_1;
+    windows_key_mapping[cast(int, '2')] = .NR_2;
+    windows_key_mapping[cast(int, '3')] = .NR_3;
+    windows_key_mapping[cast(int, '4')] = .NR_4;
+    windows_key_mapping[cast(int, '5')] = .NR_5;
+    windows_key_mapping[cast(int, '6')] = .NR_6;
+    windows_key_mapping[cast(int, '7')] = .NR_7;
+    windows_key_mapping[cast(int, '8')] = .NR_8;
+    windows_key_mapping[cast(int, '9')] = .NR_9;
+    windows_key_mapping[cast(int, '0')] = .NR_0;
+
+    windows_key_mapping[cast(int, 'A')] = .A;
+    windows_key_mapping[cast(int, 'B')] = .B;
+    windows_key_mapping[cast(int, 'C')] = .C;
+    windows_key_mapping[cast(int, 'D')] = .D;
+    windows_key_mapping[cast(int, 'E')] = .E;
+    windows_key_mapping[cast(int, 'F')] = .F;
+    windows_key_mapping[cast(int, 'G')] = .G;
+    windows_key_mapping[cast(int, 'H')] = .H;
+    windows_key_mapping[cast(int, 'I')] = .I;
+    windows_key_mapping[cast(int, 'J')] = .J;
+    windows_key_mapping[cast(int, 'K')] = .K;
+    windows_key_mapping[cast(int, 'L')] = .L;
+    windows_key_mapping[cast(int, 'M')] = .M;
+    windows_key_mapping[cast(int, 'N')] = .N;
+    windows_key_mapping[cast(int, 'O')] = .O;
+    windows_key_mapping[cast(int, 'P')] = .P;
+    windows_key_mapping[cast(int, 'Q')] = .Q;
+    windows_key_mapping[cast(int, 'R')] = .R;
+    windows_key_mapping[cast(int, 'S')] = .S;
+    windows_key_mapping[cast(int, 'T')] = .T;
+    windows_key_mapping[cast(int, 'U')] = .U;
+    windows_key_mapping[cast(int, 'V')] = .V;
+    windows_key_mapping[cast(int, 'W')] = .W;
+    windows_key_mapping[cast(int, 'X')] = .X;
+    windows_key_mapping[cast(int, 'Y')] = .Y;
+    windows_key_mapping[cast(int, 'Z')] = .Z;
+
+    windows_key_mapping[0x5B] = .LEFT_WINDOWS;
+    windows_key_mapping[0x5C] = .RIGHT_WINDOWS;
+    windows_key_mapping[0x5D] = .APPS;
+
+    windows_key_mapping[0x5F] = .SLEEP;
+
+    windows_key_mapping[0x60] = .NP_0;
+    windows_key_mapping[0x61] = .NP_1;
+    windows_key_mapping[0x62] = .NP_2;
+    windows_key_mapping[0x63] = .NP_3;
+    windows_key_mapping[0x64] = .NP_4;
+    windows_key_mapping[0x65] = .NP_5;
+    windows_key_mapping[0x66] = .NP_6;
+    windows_key_mapping[0x67] = .NP_7;
+    windows_key_mapping[0x68] = .NP_8;
+    windows_key_mapping[0x69] = .NP_9;
+    windows_key_mapping[0x6A] = .MULTIPLY;
+    windows_key_mapping[0x6B] = .ADD;
+    windows_key_mapping[0x6C] = .SEPARATOR;
+    windows_key_mapping[0x6D] = .SUBTRACT;
+    windows_key_mapping[0x6E] = .DECIMAL;
+    windows_key_mapping[0x6F] = .DIVIDE;
+    windows_key_mapping[0x70] = .F1;
+    windows_key_mapping[0x71] = .F2;
+    windows_key_mapping[0x72] = .F3;
+    windows_key_mapping[0x73] = .F4;
+    windows_key_mapping[0x74] = .F5;
+    windows_key_mapping[0x75] = .F6;
+    windows_key_mapping[0x76] = .F7;
+    windows_key_mapping[0x77] = .F8;
+    windows_key_mapping[0x78] = .F9;
+    windows_key_mapping[0x79] = .F10;
+    windows_key_mapping[0x7A] = .F11;
+    windows_key_mapping[0x7B] = .F12;
+
+    windows_key_mapping[0x90] = .NUM_LOCK;
+    windows_key_mapping[0x91] = .SCROLL_LOCK;
+
+    windows_key_mapping[0xBA] = .SEMICOLON;
+    windows_key_mapping[0xBB] = .PLUS;
+    windows_key_mapping[0xBC] = .COMMA;
+    windows_key_mapping[0xBD] = .MINUS;
+    windows_key_mapping[0xBE] = .PERIOD;
+    windows_key_mapping[0xBF] = .FORWARD_SLASH;
+    windows_key_mapping[0xC0] = .TILDE;
+    windows_key_mapping[0xDB] = .LEFT_SQUARE;
+    windows_key_mapping[0xDC] = .BACK_SLASH;
+    windows_key_mapping[0xDD] = .RIGHT_SQUARE;
+    windows_key_mapping[0xDE] = .APOSTROPHE;
+
+    // todo(josh)
+    // #define VK_GAMEPAD_A                         0xC3
+    // #define VK_GAMEPAD_B                         0xC4
+    // #define VK_GAMEPAD_X                         0xC5
+    // #define VK_GAMEPAD_Y                         0xC6
+    // #define VK_GAMEPAD_RIGHT_SHOULDER            0xC7
+    // #define VK_GAMEPAD_LEFT_SHOULDER             0xC8
+    // #define VK_GAMEPAD_LEFT_TRIGGER              0xC9
+    // #define VK_GAMEPAD_RIGHT_TRIGGER             0xCA
+    // #define VK_GAMEPAD_DPAD_UP                   0xCB
+    // #define VK_GAMEPAD_DPAD_DOWN                 0xCC
+    // #define VK_GAMEPAD_DPAD_LEFT                 0xCD
+    // #define VK_GAMEPAD_DPAD_RIGHT                0xCE
+    // #define VK_GAMEPAD_MENU                      0xCF
+    // #define VK_GAMEPAD_VIEW                      0xD0
+    // #define VK_GAMEPAD_LEFT_THUMBSTICK_BUTTON    0xD1
+    // #define VK_GAMEPAD_RIGHT_THUMBSTICK_BUTTON   0xD2
+    // #define VK_GAMEPAD_LEFT_THUMBSTICK_UP        0xD3
+    // #define VK_GAMEPAD_LEFT_THUMBSTICK_DOWN      0xD4
+    // #define VK_GAMEPAD_LEFT_THUMBSTICK_RIGHT     0xD5
+    // #define VK_GAMEPAD_LEFT_THUMBSTICK_LEFT      0xD6
+    // #define VK_GAMEPAD_RIGHT_THUMBSTICK_UP       0xD7
+    // #define VK_GAMEPAD_RIGHT_THUMBSTICK_DOWN     0xD8
+    // #define VK_GAMEPAD_RIGHT_THUMBSTICK_RIGHT    0xD9
+    // #define VK_GAMEPAD_RIGHT_THUMBSTICK_LEFT     0xDA
+}
+
+proc create_window(name: string, width: int, height: int) : Window {
+    const CLASS_NAME := "my window class";
+
+    wc: WNDCLASSEXW;
+    wc.cbSize = sizeof(WNDCLASSEXW);
+    wc.style = CS_OWNDC;
+    wc.hCursor = LoadCursorW(null, cast(^u16, IDC_ARROW));
+    wc.lpfnWndProc = win32_proc;
+    wc.hInstance = GetModuleHandleW(null);
+    success: bool;
+    string_length: i32;
+    wc.lpszClassName = to_wide_string(CLASS_NAME, default_allocator(), &success, &string_length); // @leak
+    class := RegisterClassExW(&wc);
+    assert(class != 0);
+
+    window: Window;
+    window.width = width;
+    window.height = height;
+    assert(g_currently_processing_window == null);
+    g_currently_processing_window = &window;
+    window_handle := CreateWindowExW(
+        0,
+        to_wide_string(CLASS_NAME, default_allocator(), &success, &string_length),       // @leak
+        to_wide_string(name, default_allocator(), &success, &string_length), // @leak
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        300, 150, cast(i32, width), cast(i32, height),
+        null,
+        null,
+        wc.hInstance,
+        null
+    );
+
+    assert(window_handle != null);
+    dc := GetDC(window_handle);
+    window.handle = window_handle;
+    window.dc = dc;
+    g_currently_processing_window = null;
+
+    return window;
+}
+
+proc update_window(window: ^Window) {
+    old_window := g_currently_processing_window;
+    g_currently_processing_window = window;
+    defer g_currently_processing_window = old_window;
+
+    g_currently_processing_window.mouse_position_pixel_delta = .{};
+    g_currently_processing_window.mouse_scroll = 0;
+    memset(&g_currently_processing_window.inputs_down[0], 0, cast(u64, g_currently_processing_window.inputs_down.count));
+    memset(&g_currently_processing_window.inputs_up[0],   0, cast(u64, g_currently_processing_window.inputs_up.count));
+
+    msg: MSG;
+    while (PeekMessageW(&msg, null, 0, 0, PM_REMOVE) != 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    window.updated_at_least_once = true;
+}
+
+proc win32_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) : LRESULT {
+    if (msg == WM_ACTIVATEAPP) {
+        assert(g_currently_processing_window != null);
+        g_currently_processing_window.is_focused = w != 0;
+        return 0;
+    }
+    else if (msg == WM_CLOSE) {
+        assert(g_currently_processing_window != null);
+        g_currently_processing_window.should_close = true;
+        return 0;
+    }
+    else if (msg == WM_DESTROY) {
+        PostQuitMessage(0);
+        return 0;
+    }
+    else if (msg == WM_SIZE) {
+        assert(g_currently_processing_window != null);
+
+        width  := LOWORDL(l);
+        height := HIWORDL(l);
+
+        if (width  <= 0) width  = 1;
+        if (height <= 0) height = 1;
+
+        g_currently_processing_window.width  = cast(i64, width);
+        g_currently_processing_window.height = cast(i64, height);
+        g_currently_processing_window.aspect = cast(float, width) / cast(float, height);
+        g_currently_processing_window.size   = Vector2.{cast(float, g_currently_processing_window.width), cast(float, g_currently_processing_window.height)};
+        return 0;
+    }
+    else if (msg == WM_KEYDOWN) {
+        assert(g_currently_processing_window != null);
+        input := windows_key_mapping[cast(int, w)];
+        if (!g_currently_processing_window.inputs_held[cast(int, input)]) { // @EnumArrays
+            g_currently_processing_window.inputs_down[cast(int, input)] = true; // @EnumArrays
+        }
+        g_currently_processing_window.inputs_held[cast(int, input)] = true; // @EnumArrays
+        return 0;
+    }
+    else if (msg == WM_KEYUP) {
+        assert(g_currently_processing_window != null);
+        input := windows_key_mapping[cast(int, w)];
+        g_currently_processing_window.inputs_up[cast(int, input)] = true; // @EnumArrays
+        g_currently_processing_window.inputs_held[cast(int, input)] = false; // @EnumArrays
+        return 0;
+    }
+    else if (msg == WM_SYSKEYDOWN) {
+        assert(g_currently_processing_window != null);
+        input := windows_key_mapping[cast(int, w)];
+        if (!g_currently_processing_window.inputs_held[cast(int, input)]) { // @EnumArrays
+            g_currently_processing_window.inputs_down[cast(int, input)] = true; // @EnumArrays
+        }
+        g_currently_processing_window.inputs_held[cast(int, input)] = true; // @EnumArrays
+        return 0;
+    }
+    else if (msg == WM_SYSKEYUP) {
+        assert(g_currently_processing_window != null);
+        input := windows_key_mapping[cast(int, w)];
+        g_currently_processing_window.inputs_up[cast(int, input)] = true; // @EnumArrays
+        g_currently_processing_window.inputs_held[cast(int, input)] = false; // @EnumArrays
+        return 0;
+    }
+    else if (msg == WM_MOUSEMOVE) {
+        x := LOWORDL(l);
+        y := HIWORDL(l);
+        old_pos := g_currently_processing_window.mouse_position_pixel;
+        g_currently_processing_window.mouse_position_pixel = Vector2.{cast(float, x), g_currently_processing_window.size.y - cast(float, y)};
+        g_currently_processing_window.mouse_position_unit.x = g_currently_processing_window.mouse_position_pixel.x / g_currently_processing_window.size.x;
+        g_currently_processing_window.mouse_position_unit.y = g_currently_processing_window.mouse_position_pixel.y / g_currently_processing_window.size.y;
+        if (g_currently_processing_window.updated_at_least_once) {
+            g_currently_processing_window.mouse_position_pixel_delta = g_currently_processing_window.mouse_position_pixel - old_pos;
+        }
+        return 0;
+    }
+    else if (msg == WM_MOUSEWHEEL) {
+        scroll := cast(i16, HIWORDW(w)) / 120; // note(josh): 120 is WHEEL_DELTA in windows
+        g_currently_processing_window.mouse_scroll = cast(f32, scroll);
+        return 0;
+    }
+    else if (msg == WM_LBUTTONDOWN) {
+        if (g_currently_processing_window.mouse_capture_sum == 0)  SetCapture(g_currently_processing_window.handle);
+        g_currently_processing_window.mouse_capture_sum += 1;
+
+        if (!g_currently_processing_window.inputs_held[cast(int, Input.MOUSE_LEFT)]) {
+            g_currently_processing_window.inputs_down[cast(int, Input.MOUSE_LEFT)] = true;
+        }
+        g_currently_processing_window.inputs_held[cast(int, Input.MOUSE_LEFT)] = true;
+        return 0;
+    }
+    else if (msg == WM_LBUTTONUP) {
+        g_currently_processing_window.mouse_capture_sum -= 1;
+        if (g_currently_processing_window.mouse_capture_sum == 0)  ReleaseCapture();
+
+        g_currently_processing_window.inputs_up[cast(int, Input.MOUSE_LEFT)]   = true;
+        g_currently_processing_window.inputs_held[cast(int, Input.MOUSE_LEFT)] = false;
+        return 0;
+    }
+    else if (msg == WM_MBUTTONDOWN) {
+        if (g_currently_processing_window.mouse_capture_sum == 0) SetCapture(g_currently_processing_window.handle);
+        g_currently_processing_window.mouse_capture_sum += 1;
+
+        if (!g_currently_processing_window.inputs_held[cast(int, Input.MOUSE_MIDDLE)]) {
+            g_currently_processing_window.inputs_down[cast(int, Input.MOUSE_MIDDLE)] = true;
+        }
+        g_currently_processing_window.inputs_held[cast(int, Input.MOUSE_MIDDLE)] = true;
+        return 0;
+    }
+    else if (msg == WM_MBUTTONUP) {
+        g_currently_processing_window.mouse_capture_sum -= 1;
+        if (g_currently_processing_window.mouse_capture_sum == 0) ReleaseCapture();
+
+        g_currently_processing_window.inputs_up[cast(int, Input.MOUSE_MIDDLE)]   = true;
+        g_currently_processing_window.inputs_held[cast(int, Input.MOUSE_MIDDLE)] = false;
+        return 0;
+    }
+    else if (msg == WM_RBUTTONDOWN) {
+        if (g_currently_processing_window.mouse_capture_sum == 0) SetCapture(g_currently_processing_window.handle);
+        g_currently_processing_window.mouse_capture_sum += 1;
+
+        if (!g_currently_processing_window.inputs_held[cast(int, Input.MOUSE_RIGHT)]) {
+            g_currently_processing_window.inputs_down[cast(int, Input.MOUSE_RIGHT)] = true;
+        }
+        g_currently_processing_window.inputs_held[cast(int, Input.MOUSE_RIGHT)] = true;
+        return 0;
+    }
+    else if (msg == WM_RBUTTONUP) {
+        g_currently_processing_window.mouse_capture_sum -= 1;
+        if (g_currently_processing_window.mouse_capture_sum == 0) ReleaseCapture();
+
+        g_currently_processing_window.inputs_up[cast(int, Input.MOUSE_RIGHT)]   = true;
+        g_currently_processing_window.inputs_held[cast(int, Input.MOUSE_RIGHT)] = false;
+        return 0;
+    }
+    else if (msg == WM_CHAR) {
+        // io := ImGui.GetIO();
+        // io.AddInputCharacter(io, cast,trunc(u16)w);
+        // return 0;
+    }
+    else {
+        // print("Unhandled windows message: %\n", msg);
+    }
+
+    return DefWindowProcW(hwnd, msg, w, l);
+}
+
+enum Input {
+    NONE;
+
+    MOUSE_LEFT;
+    MOUSE_RIGHT;
+    MOUSE_MIDDLE;
+
+    BACKSPACE;
+    TAB;
+
+    CLEAR; // ?
+    ENTER;
+
+    SHIFT;
+    CONTROL;
+    ALT;
+    PAUSE;
+    CAPS_LOCK;
+
+    ESCAPE;
+    SPACE;
+    PAGE_UP;
+    PAGE_DOWN;
+    END;
+    HOME;
+
+    UP;
+    DOWN;
+    LEFT;
+    RIGHT;
+
+    SELECT; // ?
+    PRINT; // ? it's not Print_Screen; so what is it?
+    EXECUTE; // ?
+    PRINT_SCREEN;
+    INSERT;
+    DELETE;
+    HELP; // ?
+
+    NR_1; NR_2; NR_3; NR_4; NR_5; NR_6; NR_7; NR_8; NR_9; NR_0;
+
+    A; B; C; D; E; F; G; H; I; J; K; L; M;
+    N; O; P; Q; R; S; T; U; V; W; X; Y; Z;
+
+    LEFT_WINDOWS;
+    RIGHT_WINDOWS;
+    APPS; // ?
+
+    SLEEP;
+
+    NP_0; NP_1; NP_2; NP_3; NP_4; NP_5; NP_6; NP_7; NP_8; NP_9;
+
+    MULTIPLY;
+    ADD;
+    SEPARATOR; // comma?
+    SUBTRACT;
+    DECIMAL; // period?
+    DIVIDE; // forward_slash?
+
+    F1; F2; F3; F4; F5; F6; F7; F8; F9; F10; F11; F12;
+
+    NUM_LOCK;
+    SCROLL_LOCK;
+
+    SEMICOLON;
+    PLUS;
+    COMMA;
+    MINUS;
+    PERIOD;
+    FORWARD_SLASH;
+    TILDE;
+    LEFT_SQUARE;
+    BACK_SLASH;
+    RIGHT_SQUARE;
+    APOSTROPHE;
+
+// todo(josh): check these out
+// #define VK_OEM_1          0xBA
+// #define VK_OEM_PLUS       0xBB
+// #define VK_OEM_COMMA      0xBC
+// #define VK_OEM_MINUS      0xBD
+// #define VK_OEM_PERIOD     0xBE
+// #define VK_OEM_2          0xBF
+// #define VK_OEM_3          0xC0
+// #define VK_OEM_4          0xDB
+// #define VK_OEM_5          0xDC
+// #define VK_OEM_6          0xDD
+// #define VK_OEM_7          0xDE
+// #define VK_OEM_8          0xDF
+
+// todo(josh): gamepad
+// #define VK_GAMEPAD_A                         0xC3
+// #define VK_GAMEPAD_B                         0xC4
+// #define VK_GAMEPAD_X                         0xC5
+// #define VK_GAMEPAD_Y                         0xC6
+// #define VK_GAMEPAD_RIGHT_SHOULDER            0xC7
+// #define VK_GAMEPAD_LEFT_SHOULDER             0xC8
+// #define VK_GAMEPAD_LEFT_TRIGGER              0xC9
+// #define VK_GAMEPAD_RIGHT_TRIGGER             0xCA
+// #define VK_GAMEPAD_DPAD_UP                   0xCB
+// #define VK_GAMEPAD_DPAD_DOWN                 0xCC
+// #define VK_GAMEPAD_DPAD_LEFT                 0xCD
+// #define VK_GAMEPAD_DPAD_RIGHT                0xCE
+// #define VK_GAMEPAD_MENU                      0xCF
+// #define VK_GAMEPAD_VIEW                      0xD0
+// #define VK_GAMEPAD_LEFT_THUMBSTICK_BUTTON    0xD1
+// #define VK_GAMEPAD_RIGHT_THUMBSTICK_BUTTON   0xD2
+// #define VK_GAMEPAD_LEFT_THUMBSTICK_UP        0xD3
+// #define VK_GAMEPAD_LEFT_THUMBSTICK_DOWN      0xD4
+// #define VK_GAMEPAD_LEFT_THUMBSTICK_RIGHT     0xD5
+// #define VK_GAMEPAD_LEFT_THUMBSTICK_LEFT      0xD6
+// #define VK_GAMEPAD_RIGHT_THUMBSTICK_UP       0xD7
+// #define VK_GAMEPAD_RIGHT_THUMBSTICK_DOWN     0xD8
+// #define VK_GAMEPAD_RIGHT_THUMBSTICK_RIGHT    0xD9
+// #define VK_GAMEPAD_RIGHT_THUMBSTICK_LEFT     0xDA
+
+    COUNT;
+}
