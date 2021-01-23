@@ -6,6 +6,7 @@
 #include "core:time.sif"
 #include "core:os.sif"
 #include "core:random.sif"
+#include "core:allocators.sif"
 
 #include "platform.sif"
 #include "external/stb/stb_image.sif"
@@ -60,13 +61,13 @@ proc main() {
     window := create_window("My Cool Window", 1920, 1080);
     init_render_backend(&window);
 
-    roboto := load_font_from_file("resources/fonts/roboto.ttf", 48, default_allocator());
+    roboto := load_font_from_file("resources/fonts/roboto.ttf", 64, default_allocator());
 
     vertex_shader_blob: ^ID3D10Blob;
-    vertex_shader         := compile_vertex_shader_from_file("basic_vertex.hlsl", &vertex_shader_blob, default_allocator());
-    pixel_shader          := compile_pixel_shader_from_file("basic_pixel.hlsl", default_allocator());
-    pixel_shader_textured := compile_pixel_shader_from_file("basic_pixel_textured.hlsl", default_allocator());
-    text_pixel_shader     := compile_pixel_shader_from_file("text_pixel.hlsl", default_allocator());
+    vertex_shader         := compile_vertex_shader_from_file("resources/shaders/basic_vertex.hlsl", &vertex_shader_blob, default_allocator());
+    pixel_shader          := compile_pixel_shader_from_file("resources/shaders/basic_pixel.hlsl", default_allocator());
+    pixel_shader_textured := compile_pixel_shader_from_file("resources/shaders/basic_pixel_textured.hlsl", default_allocator());
+    text_pixel_shader     := compile_pixel_shader_from_file("resources/shaders/text_pixel.hlsl", default_allocator());
 
     white_texture_desc: Texture_Description;
     white_texture_desc.width = 1;
@@ -83,25 +84,6 @@ proc main() {
     black_texture_pixel := [4]byte.{0, 0, 0, 255};
     black_texture_desc.color_data = &black_texture_pixel[0];
     black_texture := create_texture(black_texture_desc);
-
-    test_texture: Texture;
-    {
-        w: i32;
-        h: i32;
-        c: i32;
-        texture_name := "test_texture.png";
-        texture_data := stbi_load(&texture_name[0], &w, &h, &c, 4);
-        assert(c == 4);
-        assert(texture_data != null);
-
-        test_texture_desc: Texture_Description;
-        test_texture_desc.width  = cast(int, w);
-        test_texture_desc.height = cast(int, h);
-        test_texture_desc.format = .R8G8B8A8_UINT;
-        test_texture_desc.type = .TEXTURE2D;
-        test_texture_desc.color_data = texture_data;
-        test_texture = create_texture(test_texture_desc);
-    }
 
     vertex_fields := [3]D3D11_INPUT_ELEMENT_DESC.{
         .{"SV_POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0},
@@ -144,48 +126,13 @@ proc main() {
 
     entity_manager: Entity_Manager;
     init_entity_manager(&entity_manager, default_allocator());
-
-    player := make_entity(&entity_manager, Plane);
-    player.position.x = -4;
-    player.scale = Vector3.{1, cast(float, g_plane_texture_1.description.height) / cast(float, g_plane_texture_1.description.width), 1};
-    player.texture = g_plane_texture_1;
-
-    background_scale := Vector3.{1, cast(float, g_background_texture.description.height) / cast(float, g_background_texture.description.width), 1} * 17;
-    foreground_scale := Vector3.{1, cast(float, g_foreground_texture.description.height) / cast(float, g_foreground_texture.description.width), 1} * 17;
-
-    background_parallax_1 := make_entity(&entity_manager, Empty_Entity);
-    background_parallax_1.position.z = 5;
-    background_parallax_1.texture = g_background_texture;
-    background_parallax_1.scale = background_scale;
-    background_parallax_2 := make_entity(&entity_manager, Empty_Entity);
-    background_parallax_2.position.z = 5;
-    background_parallax_2.texture = g_background_texture;
-    background_parallax_2.scale = background_scale;
-    foreground_parallax_1 := make_entity(&entity_manager, Empty_Entity);
-    foreground_parallax_1.position.z = -1;
-    foreground_parallax_1.position.y = -4.2;
-    foreground_parallax_1.texture = g_foreground_texture;
-    foreground_parallax_1.scale = foreground_scale;
-    foreground_parallax_2 := make_entity(&entity_manager, Empty_Entity);
-    foreground_parallax_2.position.z = -1;
-    foreground_parallax_2.position.y = -4.2;
-    foreground_parallax_2.texture = g_foreground_texture;
-    foreground_parallax_2.scale = foreground_scale;
+    start_gameplay(&entity_manager);
 
     const ROCK_TIME := 3;
-    cur_rock_time: float;
 
-    enum Game_State {
-        WAITING_TO_START;
-        PLAYING;
-        DEAD;
-    }
-
-    game_state := Game_State.WAITING_TO_START;
-    current_score := 0;
-
-    ff_array := make_dynamic_array(Vertex, 10 * 1024, default_allocator());
-    defer destroy_dynamic_array(ff_array);
+    frame_arena: Arena_Allocator;
+    init_arena(&frame_arena, new_slice(byte, 10 * 1024 * 1024, default_allocator()), true);
+    temp_allocator := arena_to_allocator(&frame_arena);
 
 
 
@@ -198,38 +145,63 @@ proc main() {
         defer last_frame_start_time = frame_start_time;
         dt := cast(f32, frame_start_time - last_frame_start_time);
 
+        arena_reset(&frame_arena);
+
         update_window(&window);
         if (get_input(&window.inputs, .ESCAPE)) {
             break;
         }
 
-        if (game_state == .PLAYING) {
-            cur_rock_time -= dt;
-            if (cur_rock_time <= 0) {
-                cur_rock_time += ROCK_TIME;
-                posy := random_float32_range(-2, 2, &rand);
+        if (get_input(&window.inputs, .R)) {
+            clear_scene(&entity_manager);
+            start_gameplay(&entity_manager);
+        }
+
+        if (entity_manager.gameplay_state.game_state == .PLAYING) {
+            entity_manager.gameplay_state.cur_rock_time -= dt;
+            if (entity_manager.gameplay_state.cur_rock_time <= 0) {
+                entity_manager.gameplay_state.cur_rock_time += ROCK_TIME;
+                posy := random_f32_range(&rand, -1.75, 1.75);
+
+                difficulty_scaling: float = min(1.0, cast(float, entity_manager.gameplay_state.current_score) / 25);
+                gap_size := lerp(3.85, 4.5, 1-difficulty_scaling);
+
                 top    := make_entity(&entity_manager, Rock);
                 top.texture = g_rock_top_texture;
-                top.position = .{20, posy+4.5, 1};
+                top.position = .{20, posy+gap_size, 1};
                 top.scale = Vector3.{1, cast(float, g_rock_top_texture.description.height) / cast(float, g_rock_top_texture.description.width), 1} * 3;
+
                 bottom := make_entity(&entity_manager, Rock);
                 bottom.is_bottom_rock = true;
                 bottom.texture = g_rock_bottom_texture;
-                bottom.position = .{20, posy+-4.5, 1};
+                bottom.position = .{20, posy-gap_size, 1};
                 bottom.scale = Vector3.{1, cast(float, g_rock_bottom_texture.description.height) / cast(float, g_rock_bottom_texture.description.width), 1} * 3;
             }
         }
 
+        player := get_entity(&entity_manager, entity_manager.gameplay_state.player);
+        background_parallax_1 := get_entity(&entity_manager, entity_manager.gameplay_state.background1);
+        background_parallax_2 := get_entity(&entity_manager, entity_manager.gameplay_state.background2);
+        foreground_parallax_1 := get_entity(&entity_manager, entity_manager.gameplay_state.foreground1);
+        foreground_parallax_2 := get_entity(&entity_manager, entity_manager.gameplay_state.foreground2);
+
         const BACKGROUND_PARALLAX_SPEED := 0.1;
-        background_parallax_1.position.x = lerp(background_scale.x, -background_scale.x, cast(f32, fmod((frame_start_time * BACKGROUND_PARALLAX_SPEED)      , 5) / 5));
-        background_parallax_2.position.x = lerp(background_scale.x, -background_scale.x, cast(f32, fmod((2.5 + frame_start_time * BACKGROUND_PARALLAX_SPEED), 5) / 5));
+        background_parallax_1.position.x = lerp(background_parallax_1.scale.x, -background_parallax_1.scale.x, cast(f32, fmod((frame_start_time * BACKGROUND_PARALLAX_SPEED)      , 5) / 5));
+        background_parallax_2.position.x = lerp(background_parallax_2.scale.x, -background_parallax_2.scale.x, cast(f32, fmod((2.5 + frame_start_time * BACKGROUND_PARALLAX_SPEED), 5) / 5));
 
         const FOREGROUND_PARALLAX_SPEED := 1.1;
-        foreground_parallax_1.position.x = lerp(foreground_scale.x, -foreground_scale.x, cast(f32, fmod((frame_start_time * FOREGROUND_PARALLAX_SPEED)      , 5) / 5));
-        foreground_parallax_2.position.x = lerp(foreground_scale.x, -foreground_scale.x, cast(f32, fmod((2.5 + frame_start_time * FOREGROUND_PARALLAX_SPEED), 5) / 5));
+        foreground_parallax_1.position.x = lerp(foreground_parallax_1.scale.x, -foreground_parallax_1.scale.x, cast(f32, fmod((frame_start_time * FOREGROUND_PARALLAX_SPEED)      , 5) / 5));
+        foreground_parallax_2.position.x = lerp(foreground_parallax_2.scale.x, -foreground_parallax_2.scale.x, cast(f32, fmod((2.5 + frame_start_time * FOREGROUND_PARALLAX_SPEED), 5) / 5));
 
         const ROCK_COLLIDER_WIDTH := 0.05;
         const ROCK_COLLIDER_X_OFFSET := 0.25;
+
+        struct Collider_Data {
+            pos: Vector2;
+            size: Vector2;
+        }
+
+        colliders := make_dynamic_array(Collider_Data, 16, temp_allocator);
 
         //
         for (i := 0; i < entity_manager.all_entities.count; i += 1) {
@@ -240,14 +212,14 @@ proc main() {
 
             if (entity.kind == Plane) {
                 plane := cast(^Plane, entity);
-                if (game_state != .DEAD) {
+                if (entity_manager.gameplay_state.game_state != .DEAD) {
                     if (get_input_down(&window.inputs, .SPACE)) {
-                        game_state = .PLAYING;
+                        entity_manager.gameplay_state.game_state = .PLAYING;
                         plane.velocity.y = 7;
                     }
                 }
 
-                if (game_state != .WAITING_TO_START) {
+                if (entity_manager.gameplay_state.game_state != .WAITING_TO_START) {
                     const GRAVITY := 25;
                     plane.velocity.y -= GRAVITY * dt;
                     plane.position = plane.position + (plane.velocity * dt);
@@ -265,17 +237,16 @@ proc main() {
                 rock := cast(^Rock, entity);
                 rock.position.x -= ROCK_SPEED * dt;
 
-                if (overlap_rect_rect(.{player.position.x, player.position.y},
-                                      .{player.scale.x, player.scale.y},
-                                      .{rock.position.x + ROCK_COLLIDER_X_OFFSET, rock.position.y},
-                                      .{ROCK_COLLIDER_WIDTH, rock.scale.y})) {
-                    game_state = .DEAD;
+                if (rock.position.x < -20) {
+                    destroy_entity(entity);
+                    continue;
                 }
 
-                if (game_state == .PLAYING) {
+                append(&colliders, Collider_Data.{.{rock.position.x + ROCK_COLLIDER_X_OFFSET, rock.position.y}, .{ROCK_COLLIDER_WIDTH, rock.scale.y}});
+                if (entity_manager.gameplay_state.game_state == .PLAYING) {
                     if (player.position.x - 1 > rock.position.x) {
                         if (!rock.gave_points && rock.is_bottom_rock) {
-                            current_score += 1;
+                            entity_manager.gameplay_state.current_score += 1;
                             rock.gave_points = true;
                         }
                     }
@@ -283,6 +254,22 @@ proc main() {
             }
         }
 
+        append(&colliders, Collider_Data.{.{0,  camera.size+2.5}, .{1000, 5.1}});
+        append(&colliders, Collider_Data.{.{0, -camera.size-2.5}, .{1000, 5.1}});
+
+        player_collider_size := Vector2.{player.scale.x, player.scale.y} * 0.85;
+
+        if (entity_manager.gameplay_state.game_state == .PLAYING) {
+            for (i := 0; i < colliders.count; i += 1) {
+                collider := colliders[i];
+                if (overlap_rect_rect(.{player.position.x, player.position.y}, player_collider_size, collider.pos, collider.size)) {
+                    entity_manager.gameplay_state.game_state = .DEAD;
+                }
+            }
+        }
+
+        // add the player collider to be drawn
+        append(&colliders, Collider_Data.{.{player.position.x, player.position.y}, player_collider_size});
 
 
         ensure_swap_chain_size(window.width, window.height);
@@ -310,16 +297,14 @@ proc main() {
         set_blend_mode(.DEFAULT);
         set_primitive_topology(.TRIANGLE_LIST);
 
-        clear_dynamic_array(&ff_array);
+        ff_array := make_dynamic_array(Vertex, 10 * 1024, temp_allocator);
         ff: Fixed_Function;
         ff_begin(&ff, &ff_array);
         defer ff_end(&ff);
 
         // draw entities
         {
-            // this alloc+copy is silly
-            sorted := new_slice(Entity, entity_manager.all_entities.count, default_allocator());
-            defer delete_slice(sorted, default_allocator());
+            sorted := new_slice(Entity, entity_manager.all_entities.count, temp_allocator);
             copy_slice(sorted, entity_manager.all_entities);
 
             proc sort_proc(a: Entity, b: Entity) : int {
@@ -337,23 +322,20 @@ proc main() {
                     continue;
                 }
 
-                if (entity.kind == Plane) {
-                    // ff_quad(&ff, entity.position - entity.scale / 2, entity.position + entity.scale / 2, .{0, 1, 0, 0.25});
-                }
-                else if (entity.kind == Rock) {
-                    min := entity.position - Vector3.{ROCK_COLLIDER_WIDTH, entity.scale.y, 1} / 2;
-                    max := entity.position + Vector3.{ROCK_COLLIDER_WIDTH, entity.scale.y, 1} / 2;
-                    min.x += ROCK_COLLIDER_X_OFFSET;
-                    max.x += ROCK_COLLIDER_X_OFFSET;
-                    // ff_quad(&ff, min, max, .{0, 1, 0, 0.25});
-                }
-
                 if (entity.texture.valid) {
                     bind_shaders(vertex_shader, pixel_shader_textured);
                     bind_texture(entity.texture, 0);
                     draw_model(g_quad_model, entity.position, entity.scale, entity.orientation, .{1, 1, 1, 1});
                 }
             }
+        }
+
+        for (i := 0; i < colliders.count; i += 1) {
+            collider := colliders[i];
+            half_size := collider.size / 2;
+            min := collider.pos-half_size;
+            max := collider.pos+half_size;
+            ff_quad(&ff, .{min.x, min.y, 0}, .{max.x, max.y, 0}, .{1, 0, 0, 0.25});
         }
 
         set_depth_test(false);
@@ -372,22 +354,73 @@ proc main() {
         {
             bind_shaders(vertex_shader, pixel_shader);
             bind_texture(.{}, 0);
-            top_center_of_screen := Vector3.{window.size.x/2, window.size.y, 0};
+            top_center_of_screen := Vector3.{cast(float, cast(int, window.size.x/2)), cast(float, cast(int, window.size.y)), 0};
             ff_quad(&ff, top_center_of_screen + Vector3.{-50, -100, 0}, top_center_of_screen + Vector3.{50, 0, 0}, .{0.9, 0.8, 0.05, 1});
             ff_flush(&ff);
 
             bind_shaders(vertex_shader, text_pixel_shader);
             bind_texture(roboto.texture, 0);
             score_buffer: [4]byte;
-            str := string_ptr(&score_buffer[0], bprint(to_slice(&score_buffer), "%", current_score));
+            str := string_ptr(&score_buffer[0], bprint(to_slice(&score_buffer), "%", entity_manager.gameplay_state.current_score));
             str_width := get_string_width(str, roboto, 1);
-            ff_text(&ff, str, roboto, .{1, 1, 1, 1}, top_center_of_screen - Vector3.{str_width/2, 70, 0}, 1);
+            str_pos := top_center_of_screen - Vector3.{cast(float, cast(int, str_width/2)), 70, 0};
+            ff_text(&ff, str, roboto, .{0, 0, 0, 1}, str_pos - Vector3.{-1, 1, 0}, 1);
+            ff_text(&ff, str, roboto, .{1, 1, 1, 1}, str_pos,                      1);
+            ff_flush(&ff);
+        }
+
+        // draw controls
+        {
+            cursor := Vector3.{25, 25, 0};
+            bind_shaders(vertex_shader, text_pixel_shader);
+            bind_texture(roboto.texture, 0);
+            ff_text(&ff, "Restart: R",     roboto, .{0, 0, 0, 1}, cursor - Vector3.{-1, 1, 0}, 1);
+            ff_text(&ff, "Restart: R",     roboto, .{1, 1, 1, 1}, cursor,                      1);
+            cursor.y += roboto.pixel_height;
+            ff_text(&ff, "Jump:    Space", roboto, .{0, 0, 0, 1}, cursor - Vector3.{-1, 1, 0}, 1);
+            ff_text(&ff, "Jump:    Space", roboto, .{1, 1, 1, 1}, cursor,                      1);
             ff_flush(&ff);
         }
 
         present_to_screen(true);
         unset_render_targets();
     }
+}
+
+proc start_gameplay(using manager: ^Entity_Manager) {
+    gameplay_state = .{};
+    player := make_entity(manager, Plane);
+    player.position.x = -4;
+    player.scale = Vector3.{1, cast(float, g_plane_texture_1.description.height) / cast(float, g_plane_texture_1.description.width), 1};
+    player.texture = g_plane_texture_1;
+
+    background_scale := Vector3.{1, cast(float, g_background_texture.description.height) / cast(float, g_background_texture.description.width), 1} * 17;
+    foreground_scale := Vector3.{1, cast(float, g_foreground_texture.description.height) / cast(float, g_foreground_texture.description.width), 1} * 17;
+
+    background_parallax_1 := make_entity(manager, Empty_Entity);
+    background_parallax_1.position.z = 5;
+    background_parallax_1.texture = g_background_texture;
+    background_parallax_1.scale = background_scale;
+    background_parallax_2 := make_entity(manager, Empty_Entity);
+    background_parallax_2.position.z = 5;
+    background_parallax_2.texture = g_background_texture;
+    background_parallax_2.scale = background_scale;
+    foreground_parallax_1 := make_entity(manager, Empty_Entity);
+    foreground_parallax_1.position.z = -1;
+    foreground_parallax_1.position.y = -4.2;
+    foreground_parallax_1.texture = g_foreground_texture;
+    foreground_parallax_1.scale = foreground_scale;
+    foreground_parallax_2 := make_entity(manager, Empty_Entity);
+    foreground_parallax_2.position.z = -1;
+    foreground_parallax_2.position.y = -4.2;
+    foreground_parallax_2.texture = g_foreground_texture;
+    foreground_parallax_2.scale = foreground_scale;
+
+    gameplay_state.player      = player.id;
+    gameplay_state.background1 = background_parallax_1.id;
+    gameplay_state.background2 = background_parallax_2.id;
+    gameplay_state.foreground1 = foreground_parallax_1.id;
+    gameplay_state.foreground2 = foreground_parallax_2.id;
 }
 
 g_plane_texture_1: Texture;
@@ -411,6 +444,24 @@ struct Entity_Manager {
     all_entities: []Entity;
     entities_freelist: Dynamic_Array!(u32);
     num_entities_ever_made: u32;
+    gameplay_state: Gameplay_State;
+}
+
+enum Game_State {
+    WAITING_TO_START;
+    PLAYING;
+    DEAD;
+}
+
+struct Gameplay_State {
+    cur_rock_time: float;
+    game_state: Game_State;
+    current_score: int;
+    player: EntityID;
+    background1: EntityID;
+    background2: EntityID;
+    foreground1: EntityID;
+    foreground2: EntityID;
 }
 
 const EntityID := u64;
@@ -476,13 +527,14 @@ proc destroy_entity(entity: ^Entity) {
     entity.id = 0;
 }
 
-// proc clear_scene(using manager: ^Entity_Manager) {
-//     for (i := 0; i < all_entities.count; i += 1) {
-//         if (all_entities[i].id != 0) {
-//             append(&entities_freelist, cast(u32, i));
-//         }
-//     }
-// }
+proc clear_scene(using manager: ^Entity_Manager) {
+    for (i := 0; i < all_entities.count; i += 1) {
+        if (all_entities[i].id != 0) {
+            append(&entities_freelist, cast(u32, i));
+            all_entities[i].id = 0;
+        }
+    }
+}
 
 proc encode_entity_id(idx: u32, gen: u32) : EntityID {
     id := cast(u64, idx) << 32 | cast(u64, gen);

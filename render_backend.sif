@@ -362,7 +362,6 @@ proc init_directx(window: ^Window) {
     assert(result == S_OK);
 
     text_alpha_blend: D3D11_BLEND_DESC;
-    // text_alpha_blend.AlphaToCoverageEnable                 = .TRUE;
     text_alpha_blend.RenderTarget[0].BlendEnable           = .TRUE;
     text_alpha_blend.RenderTarget[0].SrcBlend              = D3D11_BLEND_SRC_ALPHA;
     text_alpha_blend.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
@@ -453,7 +452,7 @@ proc set_rasterizer_mode(rm: Rasterizer_Mode) {
 }
 
 proc set_blend_mode(bm: Blend_Mode) {
-    blend_factor := [4]FLOAT.{1, 1, 1, 1};
+    blend_factor := [4]FLOAT.{0, 0, 0, 0};
     if (bm == .DEFAULT)       directx_device_context.OMSetBlendState(directx_device_context, directx_alpha_blend_state, &blend_factor[0], 0xffffffff);
     else if (bm == .NO_BLEND) directx_device_context.OMSetBlendState(directx_device_context, directx_no_alpha_blend_state, &blend_factor[0], 0xffffffff);
     else if (bm == .TEXT)     directx_device_context.OMSetBlendState(directx_device_context, directx_text_alpha_blend_state, &blend_factor[0], 0xffffffff);
