@@ -182,6 +182,8 @@ directx_depth_test_state: ^ID3D11DepthStencilState;
 directx_no_depth_test_state: ^ID3D11DepthStencilState;
 linear_wrap_sampler: ^ID3D11SamplerState;
 directx_alpha_blend_state: ^ID3D11BlendState;
+directx_no_alpha_blend_state: ^ID3D11BlendState;
+directx_text_alpha_blend_state: ^ID3D11BlendState;
 directx_cur_srvs: [MAX_BOUND_TEXTURES]^ID3D11ShaderResourceView;
 directx_linear_wrap_sampler:  ^ID3D11SamplerState;
 directx_linear_clamp_sampler: ^ID3D11SamplerState;
@@ -351,6 +353,26 @@ proc init_directx(window: ^Window) {
     alpha_blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     result = directx_device.CreateBlendState(directx_device, &alpha_blend_desc, &directx_alpha_blend_state);
     assert(result == S_OK);
+
+    // no alpha blend state
+    no_blend_desc: D3D11_BLEND_DESC;
+    no_blend_desc.RenderTarget[0].BlendEnable = .FALSE;
+    no_blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    result = directx_device.CreateBlendState(directx_device, &no_blend_desc, &directx_no_alpha_blend_state);
+    assert(result == S_OK);
+
+    text_alpha_blend: D3D11_BLEND_DESC;
+    // text_alpha_blend.AlphaToCoverageEnable                 = .TRUE;
+    text_alpha_blend.RenderTarget[0].BlendEnable           = .TRUE;
+    text_alpha_blend.RenderTarget[0].SrcBlend              = D3D11_BLEND_SRC_ALPHA;
+    text_alpha_blend.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
+    text_alpha_blend.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+    text_alpha_blend.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_SRC_ALPHA;
+    text_alpha_blend.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_INV_SRC_ALPHA;
+    text_alpha_blend.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+    text_alpha_blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    result = directx_device.CreateBlendState(directx_device, &text_alpha_blend, &directx_text_alpha_blend_state);
+    assert(result == S_OK);
 }
 
 proc dx_create_render_target_view(backing_texture: ^ID3D11Texture2D, format: Texture_Format) : ^ID3D11RenderTargetView {
@@ -433,8 +455,8 @@ proc set_rasterizer_mode(rm: Rasterizer_Mode) {
 proc set_blend_mode(bm: Blend_Mode) {
     blend_factor := [4]FLOAT.{1, 1, 1, 1};
     if (bm == .DEFAULT)       directx_device_context.OMSetBlendState(directx_device_context, directx_alpha_blend_state, &blend_factor[0], 0xffffffff);
-    // else if (bm == .NO_BLEND) directx_device_context.OMSetBlendState(directx_device_context, directx_no_alpha_blend_state, blend_factor, 0xffffffff);
-    // else if (bm == .TEXT)     directx_device_context.OMSetBlendState(directx_device_context, directx_text_alpha_blend_state, blend_factor, 0xffffffff);
+    else if (bm == .NO_BLEND) directx_device_context.OMSetBlendState(directx_device_context, directx_no_alpha_blend_state, &blend_factor[0], 0xffffffff);
+    else if (bm == .TEXT)     directx_device_context.OMSetBlendState(directx_device_context, directx_text_alpha_blend_state, &blend_factor[0], 0xffffffff);
     else {
         print("Unknown Blend_Mode: %\n", bm);
         assert(false);

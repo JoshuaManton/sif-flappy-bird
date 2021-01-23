@@ -175,6 +175,18 @@ proc main() {
     const ROCK_TIME := 3;
     cur_rock_time: float;
 
+    enum Game_State {
+        WAITING_TO_START;
+        PLAYING;
+        DEAD;
+    }
+
+    game_state := Game_State.WAITING_TO_START;
+    current_score := 0;
+
+    ff_array := make_dynamic_array(Vertex, 10 * 1024, default_allocator());
+    defer destroy_dynamic_array(ff_array);
+
 
 
     game_loop_timer: Timer;
@@ -191,18 +203,21 @@ proc main() {
             break;
         }
 
-        cur_rock_time -= dt;
-        if (cur_rock_time <= 0) {
-            cur_rock_time += ROCK_TIME;
-            posy := random_float32_range(-2, 2, &rand);
-            top    := make_entity(&entity_manager, Rock);
-            top.texture = g_rock_top_texture;
-            top.position = .{20, posy+4.5, 1};
-            top.scale = Vector3.{1, cast(float, g_rock_top_texture.description.height) / cast(float, g_rock_top_texture.description.width), 1} * 3;
-            bottom := make_entity(&entity_manager, Rock);
-            bottom.texture = g_rock_bottom_texture;
-            bottom.position = .{20, posy+-4.5, 1};
-            bottom.scale = Vector3.{1, cast(float, g_rock_bottom_texture.description.height) / cast(float, g_rock_bottom_texture.description.width), 1} * 3;
+        if (game_state == .PLAYING) {
+            cur_rock_time -= dt;
+            if (cur_rock_time <= 0) {
+                cur_rock_time += ROCK_TIME;
+                posy := random_float32_range(-2, 2, &rand);
+                top    := make_entity(&entity_manager, Rock);
+                top.texture = g_rock_top_texture;
+                top.position = .{20, posy+4.5, 1};
+                top.scale = Vector3.{1, cast(float, g_rock_top_texture.description.height) / cast(float, g_rock_top_texture.description.width), 1} * 3;
+                bottom := make_entity(&entity_manager, Rock);
+                bottom.is_bottom_rock = true;
+                bottom.texture = g_rock_bottom_texture;
+                bottom.position = .{20, posy+-4.5, 1};
+                bottom.scale = Vector3.{1, cast(float, g_rock_bottom_texture.description.height) / cast(float, g_rock_bottom_texture.description.width), 1} * 3;
+            }
         }
 
         const BACKGROUND_PARALLAX_SPEED := 0.1;
@@ -213,6 +228,9 @@ proc main() {
         foreground_parallax_1.position.x = lerp(foreground_scale.x, -foreground_scale.x, cast(f32, fmod((frame_start_time * FOREGROUND_PARALLAX_SPEED)      , 5) / 5));
         foreground_parallax_2.position.x = lerp(foreground_scale.x, -foreground_scale.x, cast(f32, fmod((2.5 + frame_start_time * FOREGROUND_PARALLAX_SPEED), 5) / 5));
 
+        const ROCK_COLLIDER_WIDTH := 0.05;
+        const ROCK_COLLIDER_X_OFFSET := 0.25;
+
         //
         for (i := 0; i < entity_manager.all_entities.count; i += 1) {
             entity := &entity_manager.all_entities[i];
@@ -222,13 +240,25 @@ proc main() {
 
             if (entity.kind == Plane) {
                 plane := cast(^Plane, entity);
-                if (get_input_down(&window.inputs, .SPACE)) {
-                    plane.velocity.y = 7;
+                if (game_state != .DEAD) {
+                    if (get_input_down(&window.inputs, .SPACE)) {
+                        game_state = .PLAYING;
+                        plane.velocity.y = 7;
+                    }
                 }
-                const GRAVITY := 25;
-                plane.velocity.y -= GRAVITY * dt;
-                plane.position = plane.position + (plane.velocity * dt);
-                plane.orientation = axis_angle(.{0, 0, 1}, to_radians(plane.velocity.y * 3));
+
+                if (game_state != .WAITING_TO_START) {
+                    const GRAVITY := 25;
+                    plane.velocity.y -= GRAVITY * dt;
+                    plane.position = plane.position + (plane.velocity * dt);
+                    plane.orientation = axis_angle(.{0, 0, 1}, to_radians(plane.velocity.y * 3));
+                }
+
+                tex_idx := cast(int, fmod(frame_start_time * 30, 4));
+                if (tex_idx == 0)  plane.texture = g_plane_texture_1;
+                if (tex_idx == 1)  plane.texture = g_plane_texture_2;
+                if (tex_idx == 2)  plane.texture = g_plane_texture_3;
+                if (tex_idx == 3)  plane.texture = g_plane_texture_2;
             }
             else if (entity.kind == Rock) {
                 const ROCK_SPEED := 5;
@@ -237,9 +267,18 @@ proc main() {
 
                 if (overlap_rect_rect(.{player.position.x, player.position.y},
                                       .{player.scale.x, player.scale.y},
-                                      .{rock.position.x, rock.position.y},
-                                      .{0.05, rock.scale.y})) {
-                    printa(frame_start_time);
+                                      .{rock.position.x + ROCK_COLLIDER_X_OFFSET, rock.position.y},
+                                      .{ROCK_COLLIDER_WIDTH, rock.scale.y})) {
+                    game_state = .DEAD;
+                }
+
+                if (game_state == .PLAYING) {
+                    if (player.position.x - 1 > rock.position.x) {
+                        if (!rock.gave_points && rock.is_bottom_rock) {
+                            current_score += 1;
+                            rock.gave_points = true;
+                        }
+                    }
                 }
             }
         }
@@ -271,9 +310,7 @@ proc main() {
         set_blend_mode(.DEFAULT);
         set_primitive_topology(.TRIANGLE_LIST);
 
-        ff_array := make_dynamic_array(Vertex, 10 * 1024, default_allocator());
-        defer destroy_dynamic_array(ff_array);
-
+        clear_dynamic_array(&ff_array);
         ff: Fixed_Function;
         ff_begin(&ff, &ff_array);
         defer ff_end(&ff);
@@ -294,18 +331,58 @@ proc main() {
 
             quick_sort(sorted, sort_proc);
 
-            bind_shaders(vertex_shader, pixel_shader_textured);
             for (i := 0; i < sorted.count; i += 1) {
                 entity := &sorted[i];
                 if (entity.id == 0) {
                     continue;
                 }
 
+                if (entity.kind == Plane) {
+                    // ff_quad(&ff, entity.position - entity.scale / 2, entity.position + entity.scale / 2, .{0, 1, 0, 0.25});
+                }
+                else if (entity.kind == Rock) {
+                    min := entity.position - Vector3.{ROCK_COLLIDER_WIDTH, entity.scale.y, 1} / 2;
+                    max := entity.position + Vector3.{ROCK_COLLIDER_WIDTH, entity.scale.y, 1} / 2;
+                    min.x += ROCK_COLLIDER_X_OFFSET;
+                    max.x += ROCK_COLLIDER_X_OFFSET;
+                    // ff_quad(&ff, min, max, .{0, 1, 0, 0.25});
+                }
+
                 if (entity.texture.valid) {
+                    bind_shaders(vertex_shader, pixel_shader_textured);
                     bind_texture(entity.texture, 0);
                     draw_model(g_quad_model, entity.position, entity.scale, entity.orientation, .{1, 1, 1, 1});
                 }
             }
+        }
+
+        set_depth_test(false);
+        bind_shaders(vertex_shader, pixel_shader);
+        bind_texture(.{}, 0);
+        ff_flush(&ff); // draw colliders
+
+        ui_pass_cbuffer: Render_Pass_Constant_Buffer;
+        ui_pass_cbuffer.screen_dimensions = window.size;
+        ui_pass_cbuffer.view_matrix       = construct_view_matrix(.{0, 0, 0}, Quaternion.identity());
+        ui_pass_cbuffer.projection_matrix = construct_orthographic_matrix(0, window.size.x, 0, window.size.y, -1, 1);
+        ui_pass_cbuffer.camera_position   = .{0, 0, 0};
+        update_constant_buffer(render_pass_cbuffer_handle, &ui_pass_cbuffer, sizeof(Render_Pass_Constant_Buffer));
+
+        // draw score
+        {
+            bind_shaders(vertex_shader, pixel_shader);
+            bind_texture(.{}, 0);
+            top_center_of_screen := Vector3.{window.size.x/2, window.size.y, 0};
+            ff_quad(&ff, top_center_of_screen + Vector3.{-50, -100, 0}, top_center_of_screen + Vector3.{50, 0, 0}, .{0.9, 0.8, 0.05, 1});
+            ff_flush(&ff);
+
+            bind_shaders(vertex_shader, text_pixel_shader);
+            bind_texture(roboto.texture, 0);
+            score_buffer: [4]byte;
+            str := string_ptr(&score_buffer[0], bprint(to_slice(&score_buffer), "%", current_score));
+            str_width := get_string_width(str, roboto, 1);
+            ff_text(&ff, str, roboto, .{1, 1, 1, 1}, top_center_of_screen - Vector3.{str_width/2, 70, 0}, 1);
+            ff_flush(&ff);
         }
 
         present_to_screen(true);
@@ -361,6 +438,8 @@ struct Plane {
 
 struct Rock {
     using base: ^Entity;
+    gave_points: bool;
+    is_bottom_rock: bool;
 }
 
 struct Empty_Entity {
