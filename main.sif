@@ -480,9 +480,6 @@ struct Entity {
     scale: Vector3;
     kind: typeid;
     texture: Texture;
-    target_position: Vector3;
-    can_push: bool;
-    can_be_pushed: bool;
 }
 
 struct Plane {
