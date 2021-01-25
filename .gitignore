@@ -1,0 +1,12 @@
+*.exe
+*.pdb
+*.ll
+*.ilk
+*.obj
+*.bc
+*.dmp
+output.c
+
+.build/
+.vs/
+test.sif
